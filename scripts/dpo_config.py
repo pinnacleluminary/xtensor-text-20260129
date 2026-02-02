@@ -1,7 +1,6 @@
 from model_utility import get_model_architecture, get_model_num_params, get_use_liger, disable_flash_attention, get_gradient_checkpointing, get_gpu_count
 from copy import deepcopy
 from lrs_lookup import get_dpo_lr
-from time_estimation_utils import calculate_adaptive_checking_step, estimate_dataset_size
 
 DPO_CONFIG = {
     "0_1_b": {
@@ -235,19 +234,8 @@ def get_training_json(train_info: dict) -> dict:
     train_request["min_steps"] = 100
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
+    train_request["checking_step"] = 80
     
-    estimated_total_steps = train_request.get("min_steps", 1000)
-    dataset_size = estimate_dataset_size(train_info.get("dataset"))
-    
-    adaptive_checking_step = calculate_adaptive_checking_step(
-        total_steps=estimated_total_steps,
-        model_size=param_nums,
-        dataset_size=dataset_size,
-        min_check_step=50,
-        max_check_step=200,
-        default_step=80
-    )
-    train_request["checking_step"] = adaptive_checking_step    
     return {
         "train_request": train_request,
         "run_cmd": run_cmd

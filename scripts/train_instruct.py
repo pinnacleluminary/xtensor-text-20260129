@@ -363,9 +363,6 @@ def main():
     if checking_step >= total_steps_per_epoch:
         checking_step = total_steps_per_epoch - 2
     
-    from model_utility import get_model_num_params
-    model_size = get_model_num_params(train_request["model_name"], train_request["model_path"])
-    
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -382,8 +379,7 @@ def main():
                 checking_step=checking_step,
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
-                checking_mode=train_request.get("checking_mode", "none"),
-                model_size=model_size
+                checking_mode=train_request.get("checking_mode", "none")
             )
         ],
     )

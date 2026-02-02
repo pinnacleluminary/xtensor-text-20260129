@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+Standalone script for text model training (InstructText, DPO, and GRPO)
+"""
+
 import argparse
 import asyncio
 import json
@@ -15,8 +20,6 @@ import yaml
 from transformers import AutoTokenizer
 from state_manager import get_state, set_state
 import numpy as np
-from adaptive_lr_utils import calculate_adaptive_lr_range, IntelligentRunPrioritizer
-from model_utility import get_model_num_params
 
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -293,7 +296,7 @@ def main():
     )
 
     parser.add_argument(
-        "--reg-ratio", type=float, help="Reg ratio to use for training", default=1.24383
+        "--reg-ratio", type=float, help="Reg ratio to use for training", default=0.51389
     )
 
     args = parser.parse_args()
@@ -428,72 +431,26 @@ def main():
                 n_runs = state["next_runs"]
                 if "lrs" not in state: # first time of continue
                     current_lr = float(state["train"]["lr"])
-                    
-                    end_time_obj = datetime.strptime(train_info["end_time"], "%Y-%m-%d %H:%M:%S")
-                    end_time_obj = end_time_obj.replace(tzinfo=timezone.utc)
-                    now = datetime.now(timezone.utc)
-                    available_time = (end_time_obj - now).total_seconds()
-                    
-                    model_size = get_model_num_params(original_model_name, model_path)
-                    
-                    task_type_map = {
-                        TaskType.INSTRUCTTEXTTASK.value: "instruct",
-                        TaskType.DPOTASK.value: "dpo",
-                        TaskType.GRPOTASK.value: "grpo",
-                        TaskType.CHATTASK.value: "chat"
-                    }
-                    task_type_str = task_type_map.get(args.task_type, "instruct")
-                    
-                    adaptive_log_range = calculate_adaptive_lr_range(
-                        available_time=available_time,
-                        num_runs=n_runs,
-                        base_lr=current_lr,
-                        task_type=task_type_str
-                    )
-                    
-                    prioritizer = IntelligentRunPrioritizer()
-                    state["lrs"] = prioritizer.prioritize_runs(
-                        base_lr=current_lr,
-                        num_runs=n_runs,
-                        available_time=available_time,
-                        model_size=model_size,
-                        log_range=adaptive_log_range
-                    )
-                    
-                    if len(state["lrs"]) != n_runs:
-                        print(f"Prioritization failed, using default method", flush=True)
-                        state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=adaptive_log_range)
-                    
+                    state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
                     assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
                     state["runs"] = []
-                    print(f"Using adaptive LR range: {adaptive_log_range:.4f} with {n_runs} prioritized runs", flush=True)
                 
                 set_state(state)
                 state["runs"].append(state["train"].copy())
                 delete_poor_checkpoints(state["runs"])
-                
-                from convergence_detector import ConvergenceDetector
-                convergence_detector = ConvergenceDetector()
-                if convergence_detector.should_skip_remaining_runs(state["runs"]):
-                    print(f"Early convergence detected - losses are very similar. Skipping remaining {n_runs - len(state['runs'])} runs.", flush=True)
-                    c_train_info["train_request"]["checking_mode"] = "none"
-                    index = np.argmin([run["current_loss"] for run in state["runs"]])
-                    print(f"BL;{index};{state['runs'][index]['current_loss']}; {state['lrs'][index]}", flush=True)
-                    train_cmd = state["runs"][index]["train_cmd"]
-                    final_output_dir = state["runs"][index]["output_dir"]
-                    state["mode"] = "finish"
-                elif len(state["runs"]) < n_runs:
+                if len(state["runs"]) < n_runs:
                     index = len(state["runs"])
                     current_lr = state["lrs"][index]
                     train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
-                else:
+                else: # the final run
+                    # first find from runs the best loss
                     c_train_info["train_request"]["checking_mode"] = "none"
                     index = np.argmin([run["current_loss"] for run in state["runs"]])
                     print(f"BL;{index};{state['runs'][index]['current_loss']}; {state['lrs'][index]}", flush=True)
                     train_cmd = state["runs"][index]["train_cmd"]  #replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
                     final_output_dir = state["runs"][index]["output_dir"]
                     state["mode"] = "finish"
-            else:
+            else: # the state = finish; no need to run more
                 assert state["mode"] == "finish"
                 break
         
@@ -531,22 +488,7 @@ def main():
             time.sleep(5)
             if not success:
                 print(f"Training failed for task {args.task_id} at count={count}", flush=True)
-                break
-            
-            if state.get("mode") == "continue" and "runs" in state and len(state["runs"]) > 0:
-                try:
-                    current_lr = float(state["train"]["lr"])
-                    current_loss = state["runs"][-1].get("current_loss", float('inf'))
-                    model_size = get_model_num_params(original_model_name, model_path)
-                    
-                    prioritizer = IntelligentRunPrioritizer()
-                    prioritizer.update_history(
-                        lr=current_lr,
-                        performance=current_loss,
-                        model_size=model_size
-                    )
-                except Exception as e:
-                    print(f"Failed to update LR history: {e}", flush=True) 
+                break 
         
         count += 1
 

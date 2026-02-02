@@ -14,9 +14,6 @@ from transformers.trainer_utils import is_main_process
 import wandb
 import torch
 from state_manager import get_state, set_state
-from time_estimation_utils import TimeEstimator, calculate_dynamic_buffer
-from convergence_detector import ConvergenceDetector
-from typing import Optional
 MAX_TRIES = 9
 
 
@@ -49,8 +46,7 @@ class CustomEvalSaveCallback(TrainerCallback):
         checking_step: int = 100,
         total_steps_all_epochs: int = -1,
         end_time: str = "",
-        checking_mode: str = "none",
-        model_size: Optional[int] = None
+        checking_mode: str = "none"
     ):
         self.function_when_to_evaluate = function_when_to_evaluate
         self.submission_dir = submission_dir
@@ -66,11 +62,6 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.total_steps_all_epochs = total_steps_all_epochs
         self.checking_mode = checking_mode
         self.end_time = end_time
-        self.model_size = model_size
-        
-        self.time_estimator = TimeEstimator(alpha=0.3)
-        self.start_time = None
-        self.convergence_detector = ConvergenceDetector(patience=3, min_improvement=0.001)
         
     def compute_loss(self, state: TrainerState, metrics):
         return metrics.get("eval_loss", None)
@@ -81,14 +72,6 @@ class CustomEvalSaveCallback(TrainerCallback):
         # TODO: implement the logic to save the model without evaluating if there is no check points --> avoid evaluating takes too much time
         # Check if the checking_step is reached
         # print(f"Checking the model at step: {state.global_step}, checking_step: {self.checking_step}, checking_mode: {self.checking_mode}", flush=True)
-        
-        if self.start_time is None:
-            self.start_time = datetime.datetime.now()
-        
-        if state.global_step > 0:
-            elapsed_time = (datetime.datetime.now() - self.start_time).total_seconds()
-            self.time_estimator.update(state.global_step, elapsed_time)
-        
         if state.global_step == self.checking_step and self.checking_mode == "first_time":
             # print(f"Checking the model at step: {state.global_step}", flush=True)
             # check the time so far to estimate the training time in total 
@@ -102,43 +85,22 @@ class CustomEvalSaveCallback(TrainerCallback):
             log_content += f"\nPreparation time: {preparation_time}"
             time_so_far = (now - start_time_obj).total_seconds()
             log_content += f"\nTime so far: {time_so_far}"
-            
-            training_time_elapsed = (now - start_train_time_obj).total_seconds()
-            time_for_one_step = training_time_elapsed / self.checking_step
-            
-            ema_time_per_step = self.time_estimator.get_time_per_step()
-            if ema_time_per_step:
-                time_for_one_step = ema_time_per_step
-                log_content += f"\nTime for one step (EMA): {time_for_one_step:.4f}"
-            else:
-                log_content += f"\nTime for one step: {time_for_one_step:.4f}"
-            
+            time_for_one_step = (now - start_train_time_obj).total_seconds() / self.checking_step
+            log_content += f"\nTime for one step: {time_for_one_step}"
+            # Now estimate the total training time for this training
             log_content += f"\nTotal steps all epochs: {self.total_steps_all_epochs}"
-            
-            mean_remaining, lower_bound, upper_bound = self.time_estimator.predict_remaining_time(
-                state.global_step, self.total_steps_all_epochs
-            )
-            total_remaining_training_time = mean_remaining
-            log_content += f"\nTotal remaining training time (EMA): {total_remaining_training_time:.2f}s"
-            log_content += f"\nConfidence interval: [{lower_bound:.2f}s, {upper_bound:.2f}s]"
-            
+            total_remaining_training_time = time_for_one_step * (self.total_steps_all_epochs - state.global_step)
+            log_content += f"\nTotal remaining training time: {total_remaining_training_time}"
             # n * time_so_far + total_remaining_training_time = total_remaining_time
             end_time_obj = datetime.datetime.strptime(self.end_time, "%Y-%m-%d %H:%M:%S")
             total_remaining_time = (end_time_obj - now).total_seconds()
-            log_content += f"\nTotal remaining time: {total_remaining_time:.2f}s"
-            
-            dynamic_buffer = calculate_dynamic_buffer(
-                estimated_eval_time=500,
-                estimated_save_time=300,
-                model_size=self.model_size,
-                checkpoint_size_mb=None,
-                network_latency=0.0
-            )
-            log_content += f"\nDynamic buffer: {dynamic_buffer:.2f}s"
+            log_content += f"\nTotal remaining time: {total_remaining_time}"
             
             # n * time_so_far + (time_so_far + total_remaining_training_time) = total_remaining_time
+            # time_so_far + total_remaining_training_time is the time it takes to finish the training (need to estimate the eval time and save time, assuming this is 15 minutes)
+            # assuming time_so_far is + 5 minutes, just in case the checking step takes more time than expected
             max_var_time_sofar = 3 * 60
-            n = (total_remaining_time - (time_so_far + total_remaining_training_time + dynamic_buffer)) / (time_so_far + max_var_time_sofar)
+            n = (total_remaining_time - (time_so_far + total_remaining_training_time + 12 * 60)) / (time_so_far + max_var_time_sofar) # 300 = 5 minutes, assume that it extra time would be more or less 5 minutes
             n = int(n)
             my_state["check_details"] = {
                 "now": str(now.strftime("%Y-%m-%d %H:%M:%S")),
@@ -150,11 +112,8 @@ class CustomEvalSaveCallback(TrainerCallback):
                 "preparation_time": preparation_time,
                 "time_so_far": time_so_far,
                 "time_for_one_step": time_for_one_step,
-                "ema_time_per_step": ema_time_per_step if ema_time_per_step else time_for_one_step,
                 "total_remaining_training_time": total_remaining_training_time,
                 "total_remaining_time": total_remaining_time,
-                "dynamic_buffer": dynamic_buffer,
-                "confidence_interval": {"lower": lower_bound, "upper": upper_bound},
                 "end_time": self.end_time,
             }
             if n > 0: # we should try more 
@@ -184,31 +143,20 @@ class CustomEvalSaveCallback(TrainerCallback):
             my_state = get_state()
             current_loss = state.log_history[-1]["loss"]
             my_state["train"]["current_loss"] = current_loss
-            
-            convergence_info = self.convergence_detector.check_convergence(current_loss)
-            if convergence_info['converged']:
-                print(f"Convergence detected: {convergence_info['reason']}", flush=True)
-                log_content += f"\nConvergence detected: {convergence_info['reason']}"
-                
-            if "runs" in my_state and len(my_state["runs"]) >= 2:
-                should_skip = self.convergence_detector.should_skip_remaining_runs(my_state["runs"])
-                if should_skip:
-                    print(f"Losses are very similar, skipping remaining runs to save time", flush=True)
-                    log_content += f"\nSkipping remaining runs (loss variance too low)"
-                    my_state["mode"] = "finish"
-                    control.should_training_stop = False
-                    if is_main_process(LOCAL_RANK):
-                        set_state(my_state)
-                    return control
                 
             control.should_training_stop = True
 
             # Check if current_loss > current min_loss --> do not save to save time and space
+            # 
+            # if my_state["train"]["current_loss"] > current_min_loss:
+            #     print(f"Current loss: {my_state['train']['current_loss']} is greater than the current min_loss: {current_min_loss}, do not save the checkpoint", flush=True)
+            #     control.should_save = False
+            # check if this is the last run and the current_loss is the lowest --> keep running the training
             current_is_the_best = False
             current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
             if current_loss <= current_min_loss:
                 if len(my_state["runs"]) + 1 == my_state["next_runs"]:
-                    print(f"Current loss: {my_state['train']['current_loss']} is the best so far", flush=True)
+                    print(f"Current loss: {my_state['train']['current_loss']} is greater than: {current_min_loss}", flush=True)
                     current_is_the_best = True
                     
             if current_is_the_best:

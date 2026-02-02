@@ -8,7 +8,6 @@ from model_utility import (
 )
 from copy import deepcopy
 from lrs_lookup import get_instruct_lr
-from time_estimation_utils import calculate_adaptive_checking_step, estimate_dataset_size
 
 
 FIXED_BS_CONFIG = {
@@ -280,30 +279,16 @@ def get_training_json(train_info: dict) -> dict:
     train_request["save_before_remaining_time"] = 3
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
+    train_request["checking_step"] = 70
 
-    estimated_total_steps = train_request.get("min_steps", 1000)
     if param_nums < 1_000_000_000:
         train_request["min_steps"] = max(
             int(train_info["hours_to_complete"] * 100), train_request["min_steps"]
         )
-        estimated_total_steps = train_request["min_steps"]
+
     elif param_nums < 9_000_000_000:
         train_request["min_steps"] = max(
             int(train_info["hours_to_complete"] * 70), train_request["min_steps"]
         )
-        estimated_total_steps = train_request["min_steps"]
-    
-    dataset_size = estimate_dataset_size(train_info.get("dataset"))
-    
-    adaptive_checking_step = calculate_adaptive_checking_step(
-        total_steps=estimated_total_steps,
-        model_size=param_nums,
-        dataset_size=dataset_size,
-        min_check_step=30,
-        max_check_step=150,
-        default_step=70
-    )
-    train_request["checking_step"] = adaptive_checking_step
-    print(f"Using adaptive checking step: {adaptive_checking_step} (model_size={param_nums}, dataset_size={dataset_size})", flush=True)
 
     return {"train_request": train_request, "run_cmd": run_cmd}
