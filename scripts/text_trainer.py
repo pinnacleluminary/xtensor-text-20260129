@@ -296,7 +296,7 @@ def main():
     )
 
     parser.add_argument(
-        "--reg-ratio", type=float, help="Reg ratio to use for training", default=0.051487
+        "--reg-ratio", type=float, help="Reg ratio to use for training", default=1.24383
     )
 
     args = parser.parse_args()
@@ -377,6 +377,8 @@ def main():
         args.task_type == TaskType.INSTRUCTTEXTTASK.value
         or args.task_type == TaskType.CHATTASK.value
     ):
+        if args.task_type == TaskType.INSTRUCTTEXTTASK.value:
+            train_info["reg_ratio"] = 1.35494
         train_info = get_instruct_training_json(train_info)
         tokenize_cmd = (
             f"/workspace/axo_py/bin/python tokenize_instruct.py {request_path}"
