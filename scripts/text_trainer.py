@@ -243,7 +243,7 @@ def delete_poor_checkpoints(train_runs: list[dict]):
 def get_log_scale(task_type: str):
     log_scale_map = {
         TaskType.INSTRUCTTEXTTASK.value: 0.18,
-        TaskType.DPOTASK.value: 0.25,
+        TaskType.DPOTASK.value: 0.18,
         TaskType.GRPOTASK.value: 0.2,
         TaskType.CHATTASK.value: 0.18,
     }
@@ -386,7 +386,6 @@ def main():
         train_cmd = train_info["run_cmd"]
 
     elif args.task_type == TaskType.DPOTASK.value:
-        train_info["reg_ratio"] = 1.15
         train_info = get_dpo_training_json(train_info)
         tokenize_cmd = f"python tokenize_dpo.py {request_path}"
         train_cmd = train_info["run_cmd"]
