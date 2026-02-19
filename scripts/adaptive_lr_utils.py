@@ -42,10 +42,10 @@ def calculate_adaptive_lr_range(
     
     # Task-specific base ranges
     task_ranges = {
-        "instruct": (0.12, 0.25),
-        "dpo": (0.12, 0.25),
-        "grpo": (0.15, 0.28),
-        "chat": (0.12, 0.25)
+        "instruct": (0.1, 0.28),
+        "dpo": (0.1, 0.28),
+        "grpo": (0.15, 0.33),
+        "chat": (0.1, 0.28)
     }
     
     task_min, task_max = task_ranges.get(task_type.lower(), (min_range, max_range))
