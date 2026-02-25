@@ -210,7 +210,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --save_strategy no \
     --logging_steps 5 \
     --learning_rate {learning_rate} \
-    --weight_decay 0. \
+    --weight_decay 0.01 \
     --warmup_steps 35 \
     --lr_scheduler_type cosine_with_min_lr \
     --lr_scheduler_kwargs "{\\"min_lr_rate\\": {min_lr_rate}}" \
@@ -347,7 +347,9 @@ def get_training_json(train_info: dict) -> dict:
         else:
             print(f"Using lr from config: {run_config['learning_rate']}", flush=True)
 
+    base_lr = run_config["learning_rate"]
     run_config["learning_rate"] *= train_info["reg_ratio"]
+    print(f"Applied reg_ratio: {base_lr:.8f} * {train_info['reg_ratio']:.6f} = {run_config['learning_rate']:.8f}", flush=True)
 
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
 

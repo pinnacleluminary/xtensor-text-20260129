@@ -78,7 +78,7 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
 
 
 def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
-    match = re.search(f"(?P<p>--{arg_name}(\s+)([^\s]+))(\s+)", cmd)
+    match = re.search(rf"(?P<p>--{arg_name}(\s+)([^\s]+))(\s+)", cmd)
     if match:
         left_index = match.start("p")
         right_index = match.end("p")
@@ -88,7 +88,7 @@ def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
 
 
 def extract_value_from_cmd(cmd: str, arg_name: str):
-    match = re.search(f"(?P<p>--{arg_name}(\s+)(?P<value>[^\s]+))(\s+)", cmd)
+    match = re.search(rf"(?P<p>--{arg_name}(\s+)(?P<value>[^\s]+))(\s+)", cmd)
     if match:
         return match.group("value")
     else:
@@ -146,6 +146,14 @@ def run_training(
     task_type: str,
     expected_repo_name: str,
 ):
+    # Clear GPU cache before starting training to avoid memory fragmentation
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except:
+        pass
+    
     for i in range(retries):
         print(
             f"************* Training attempt {i+1}/{retries} for task {task_id}*************",
@@ -194,14 +202,29 @@ def run_training(
             "WANDB_MODE": "offline",
             "WANDB_RUN_ID": f"{task_id}_{expected_repo_name}",
             "WANDB_NAME": f"{task_id}_{expected_repo_name}",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
 
         run_cmd_with_log(train_cmd, log_path, env_vars=training_env_vars)
-        # check if training is successfully here so we can break the loop; if output_dir contains file: "successs.txt" return true
+        # check if training is successfully here so we can break the loop; if output_dir contains file: "success.txt" return true
         output_dir = extract_value_from_cmd(train_cmd, "output_dir")
         if os.path.exists(os.path.join(output_dir, "success.txt")):
+            # Clear GPU cache after successful training
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except:
+                pass
             return True
         time.sleep(5)
+        # Clear GPU cache after failed attempt
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except:
+            pass
     return False
 
 
@@ -232,12 +255,25 @@ def patch_wandb_symlinks(base_dir: str):
 
 
 def delete_poor_checkpoints(train_runs: list[dict]):
-    lowest_loss = min([run["current_loss"] for run in train_runs])
-    for run in train_runs:
-        if run["current_loss"] > lowest_loss:
-            if os.path.exists(run["output_dir"]):
-                print(f"Deleting checkpoint {run['output_dir']} with loss {run['current_loss']}", flush=True)
-                shutil.rmtree(run["output_dir"])
+    # Use eval_loss for deletion if available, otherwise use current_loss
+    if all("current_eval_loss" in run for run in train_runs):
+        # Use eval_loss for better checkpoint management
+        losses_for_comparison = [run.get("current_eval_loss", run["current_loss"]) for run in train_runs]
+        lowest_loss = min(losses_for_comparison)
+        for run in train_runs:
+            run_loss = run.get("current_eval_loss", run["current_loss"])
+            if run_loss > lowest_loss:
+                if os.path.exists(run["output_dir"]):
+                    print(f"Deleting checkpoint {run['output_dir']} with eval_loss {run_loss:.6f} (train_loss: {run['current_loss']:.6f})", flush=True)
+                    shutil.rmtree(run["output_dir"])
+    else:
+        # Fallback to current_loss
+        lowest_loss = min([run["current_loss"] for run in train_runs])
+        for run in train_runs:
+            if run["current_loss"] > lowest_loss:
+                if os.path.exists(run["output_dir"]):
+                    print(f"Deleting checkpoint {run['output_dir']} with loss {run['current_loss']}", flush=True)
+                    shutil.rmtree(run["output_dir"])
 
 
 def get_log_scale(task_type: str):
@@ -248,6 +284,107 @@ def get_log_scale(task_type: str):
         TaskType.CHATTASK.value: 0.18,
     }
     return log_scale_map[task_type]
+
+
+def calculate_reg_ratio(
+    task_type: str = None,
+    batch_size: int = None,
+    model_params: int = None,
+    base_lr: float = None,
+    method: str = "experimental"
+) -> float:
+    """
+    Calculate reg_ratio (learning rate adjustment factor) based on training parameters.
+    
+    Args:
+        task_type: Type of task (InstructTextTask, DpoTask, GrpoTask, ChatTask)
+        batch_size: Total batch size (per_device_batch_size * num_gpus * gradient_accumulation)
+        model_params: Number of model parameters
+        base_lr: Base learning rate before reg_ratio adjustment
+        method: Calculation method - "experimental" (default 1.24383), "sqrt_batch" (sqrt scaling),
+                "linear_batch" (linear scaling), or "adaptive" (combination)
+    
+    Returns:
+        Calculated reg_ratio value
+    """
+    if method == "experimental":
+        # Return the empirically determined default value
+        print(f"  [reg_ratio] Using experimental method: returning default value 1.24383", flush=True)
+        return 1.24383
+    
+    elif method == "sqrt_batch":
+        # Square root scaling: reg_ratio = sqrt(batch_size / reference_batch_size)
+        # Reference batch size of 64 is common
+        if batch_size is None or batch_size <= 0:
+            print(f"  [reg_ratio] sqrt_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
+            return 1.24383
+        reference_batch = 64
+        calculated = np.sqrt(batch_size / reference_batch)
+        print(f"  [reg_ratio] sqrt_batch method: sqrt({batch_size}/{reference_batch}) = {calculated:.6f}", flush=True)
+        return calculated
+    
+    elif method == "linear_batch":
+        # Linear scaling: reg_ratio = batch_size / reference_batch_size
+        if batch_size is None or batch_size <= 0:
+            print(f"  [reg_ratio] linear_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
+            return 1.24383
+        reference_batch = 64
+        calculated = batch_size / reference_batch
+        print(f"  [reg_ratio] linear_batch method: {batch_size}/{reference_batch} = {calculated:.6f}", flush=True)
+        return calculated
+    
+    elif method == "adaptive":
+        # Adaptive calculation based on multiple factors
+        reg_ratio = 1.0
+        print(f"  [reg_ratio] adaptive method: starting with base=1.0", flush=True)
+        
+        # Batch size adjustment (sqrt scaling)
+        if batch_size is not None and batch_size > 0:
+            reference_batch = 64
+            batch_factor = np.sqrt(batch_size / reference_batch)
+            print(f"  [reg_ratio]   - batch_size adjustment: sqrt({batch_size}/{reference_batch}) = {batch_factor:.6f}", flush=True)
+            reg_ratio *= batch_factor
+            print(f"  [reg_ratio]   - after batch adjustment: {reg_ratio:.6f}", flush=True)
+        
+        # Model size adjustment (larger models may need different scaling)
+        if model_params is not None:
+            if model_params > 10_000_000_000:  # > 10B params
+                adjustment = 0.95
+                print(f"  [reg_ratio]   - model_size adjustment: {model_params/1e9:.1f}B params -> factor {adjustment:.2f}", flush=True)
+                reg_ratio *= adjustment
+            elif model_params < 1_000_000_000:  # < 1B params
+                adjustment = 1.05
+                print(f"  [reg_ratio]   - model_size adjustment: {model_params/1e6:.1f}M params -> factor {adjustment:.2f}", flush=True)
+                reg_ratio *= adjustment
+            else:
+                print(f"  [reg_ratio]   - model_size adjustment: {model_params/1e9:.1f}B params -> no adjustment", flush=True)
+            print(f"  [reg_ratio]   - after model adjustment: {reg_ratio:.6f}", flush=True)
+        
+        # Task type adjustment
+        if task_type:
+            task_adjustments = {
+                TaskType.GRPOTASK.value: 1.0,  # No adjustment
+                TaskType.DPOTASK.value: 1.02,
+                TaskType.INSTRUCTTEXTTASK.value: 1.02,
+                TaskType.CHATTASK.value: 1.02,
+            }
+            task_factor = task_adjustments.get(task_type, 1.0)
+            print(f"  [reg_ratio]   - task_type adjustment: {task_type} -> factor {task_factor:.2f}", flush=True)
+            reg_ratio *= task_factor
+            print(f"  [reg_ratio]   - after task adjustment: {reg_ratio:.6f}", flush=True)
+        
+        # Ensure reasonable bounds
+        original = reg_ratio
+        reg_ratio = max(0.5, min(2.0, reg_ratio))
+        if original != reg_ratio:
+            print(f"  [reg_ratio]   - clamping: {original:.6f} -> {reg_ratio:.6f} (bounds: 0.5-2.0)", flush=True)
+        
+        print(f"  [reg_ratio] adaptive method: final result = {reg_ratio:.6f}", flush=True)
+        return reg_ratio
+    
+    else:
+        # Unknown method, return default
+        return 1.24383
 
 
 def main():
@@ -296,12 +433,47 @@ def main():
     )
 
     parser.add_argument(
-        "--reg-ratio", type=float, help="Reg ratio to use for training", default=1.24383
+        "--reg-ratio", 
+        type=float, 
+        help="Reg ratio to use for training (overrides --reg-ratio-method if both provided)", 
+        default=None
+    )
+    parser.add_argument(
+        "--reg-ratio-method",
+        type=str,
+        choices=["experimental", "sqrt_batch", "linear_batch", "adaptive"],
+        help="Method to calculate reg_ratio: 'experimental' (default 1.24383), 'sqrt_batch' (sqrt batch scaling), 'linear_batch' (linear batch scaling), 'adaptive' (multi-factor)",
+        default="experimental"
     )
 
     args = parser.parse_args()
+    
+    # Calculate reg_ratio if not explicitly provided
+    print(f"\n{'='*60}", flush=True)
+    print(f"REG_RATIO CALCULATION", flush=True)
+    print(f"{'='*60}", flush=True)
+    if args.reg_ratio is None:
+        # Note: For dynamic calculation, batch_size and model_params would need to be determined
+        # from config files. For now, use the experimental default.
+        # You can enhance this by reading from config after it's created.
+        print(f"Calculating reg_ratio using method: '{args.reg_ratio_method}'", flush=True)
+        print(f"Task type: {args.task_type}", flush=True)
+        args.reg_ratio = calculate_reg_ratio(
+            task_type=args.task_type,
+            method=args.reg_ratio_method
+        )
+        print(f"\n[OK] Final calculated reg_ratio: {args.reg_ratio:.6f}", flush=True)
+    else:
+        print(f"Using explicitly provided reg_ratio: {args.reg_ratio:.6f}", flush=True)
+    print(f"{'='*60}\n", flush=True)
     original_model_name = args.model
     original_task_type = args.task_type
+
+    # Short-job mode: prioritize getting to GPU training fast and avoid multi-run restarts
+    # which add overhead (re-tokenization, repeated training launches, checkpoint churn).
+    disable_multirun = os.getenv("DISABLE_MULTIRUN", "0") == "1" or args.hours_to_complete <= 0.75
+    if disable_multirun:
+        print("DISABLE_MULTIRUN enabled (short-job mode): will run exactly one training run.", flush=True)
 
     for directory in train_cst.AXOLOTL_DIRECTORIES.values():
         os.makedirs(directory, exist_ok=True)
@@ -424,7 +596,7 @@ def main():
             c_train_info["train_request"]["checking_mode"] = "none"
         else:
             if state["mode"] == "initial":
-                c_train_info["train_request"]["checking_mode"] = "first_time"
+                c_train_info["train_request"]["checking_mode"] = "none" if disable_multirun else "first_time"
                 
             elif state["mode"] == "continue":
                 c_train_info["train_request"]["checking_mode"] = "second_time"
@@ -442,12 +614,26 @@ def main():
                     index = len(state["runs"])
                     current_lr = state["lrs"][index]
                     train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
-                else: # the final run
-                    # first find from runs the best loss
+                else: # the final run - continue training the best checkpoint to completion
+                    # CRITICAL: Use eval_loss for selection if available, otherwise fall back to current_loss
+                    # This is the key improvement - eval_loss is what matters for generalization
+                    if all("current_eval_loss" in run for run in state["runs"]):
+                        # Use eval_loss for selection (much better than train_loss)
+                        losses_for_selection = [run.get("current_eval_loss", run["current_loss"]) for run in state["runs"]]
+                        index = np.argmin(losses_for_selection)
+                        selected_loss = state["runs"][index]["current_eval_loss"]
+                        print(f"BL (using eval_loss);{index};eval_loss={selected_loss:.6f};train_loss={state['runs'][index]['current_loss']:.6f};lr={state['lrs'][index]}", flush=True)
+                    else:
+                        # Fallback to current_loss if eval_loss not available (backward compatibility)
+                        losses_for_selection = [run["current_loss"] for run in state["runs"]]
+                        index = np.argmin(losses_for_selection)
+                        selected_loss = state["runs"][index]["current_loss"]
+                        print(f"BL (using train_loss fallback);{index};{selected_loss:.6f}; {state['lrs'][index]}", flush=True)
+                    
                     c_train_info["train_request"]["checking_mode"] = "none"
-                    index = np.argmin([run["current_loss"] for run in state["runs"]])
-                    print(f"BL;{index};{state['runs'][index]['current_loss']}; {state['lrs'][index]}", flush=True)
-                    train_cmd = state["runs"][index]["train_cmd"]  #replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
+                    # Use the best checkpoint's train_cmd and output_dir
+                    # The trainer will automatically resume from the last checkpoint in that directory
+                    train_cmd = state["runs"][index]["train_cmd"]
                     final_output_dir = state["runs"][index]["output_dir"]
                     state["mode"] = "finish"
             else: # the state = finish; no need to run more
@@ -456,7 +642,11 @@ def main():
         
         set_state(state)
         if train_cmd:
-            run_output_dir = output_dir + f"_{count}" if not final_output_dir else final_output_dir
+            # If we have a final_output_dir (best checkpoint), use it; otherwise create new one
+            if final_output_dir:
+                run_output_dir = final_output_dir
+            else:
+                run_output_dir = output_dir + f"_{count}"
             train_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
             
             current_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_{count}.json")
@@ -489,6 +679,13 @@ def main():
             if not success:
                 print(f"Training failed for task {args.task_id} at count={count}", flush=True)
                 break 
+
+            # In short-job mode we deliberately avoid multi-run search/restarts.
+            if disable_multirun:
+                state = get_state()
+                state["mode"] = "finish"
+                set_state(state)
+                break
         
         count += 1
 

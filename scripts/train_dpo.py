@@ -25,7 +25,7 @@ from peft import (
 from transformers import TrainerCallback
 import argparse
 import os
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback
 from state_manager import get_state, set_state
 
 # from packing.packed_dataset import PackedDataset
@@ -145,6 +145,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Ensure consistent padding side for causal LMs (matches validator)
+    tokenizer.padding_side = "left"  # Left padding for causal LMs
 
     # max_length = get_max_length_config()
     # if "max_length" in train_request:
@@ -310,13 +312,18 @@ def main():
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
                 checking_mode=train_request.get("checking_mode", "none")
-            )
+            ),
+            EarlyStoppingCallback(patience=300, min_delta=0.0001)
         ],
     )
     
-    print("Start training ...", flush=True)       
-    # trainer.train()
-    trainer.train()
+    print("Start training ...", flush=True)
+    # Automatically resume from last checkpoint if one exists
+    from transformers.trainer_utils import get_last_checkpoint
+    last_checkpoint = get_last_checkpoint(training_args.output_dir)
+    if last_checkpoint:
+        log_info(f"Resuming from checkpoint: {last_checkpoint}")
+    trainer.train(resume_from_checkpoint=last_checkpoint if last_checkpoint else None)
     
     if is_main_process(LOCAL_RANK):
         with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:

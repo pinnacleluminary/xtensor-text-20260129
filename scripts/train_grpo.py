@@ -11,9 +11,15 @@ from utility import log_info
 from transformers import AutoTokenizer, BitsAndBytesConfig
 import transformers
 import torch
-from transformers.trainer_utils import is_main_process
+from transformers.trainer_utils import is_main_process, get_last_checkpoint
 from dataclasses import dataclass, field
-from transformers import Trainer
+from transformers import (
+    Trainer,
+    TrainingArguments,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl,
+)
 from trl import GRPOConfig, GRPOTrainer, ModelConfig
 from trl import get_kbit_device_map, get_peft_config, get_quantization_config
 from peft import (
@@ -25,30 +31,19 @@ from peft import (
     AutoPeftModelForCausalLM,
 )
 import traceback
-from transformers import TrainerCallback
 import argparse
 import math
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, GRPOCustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback
 from transformers.modeling_utils import is_deepspeed_zero3_enabled
 import os
 import glob
-from transformers import (
-    Trainer,
-    TrainingArguments,
-    TrainerCallback,
-    TrainerState,
-    TrainerControl,
-)
-import os
 import datetime
 import shutil
 from huggingface_hub import HfApi
 from typing import Callable, Optional
 import bitsandbytes as bnb
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import yaml
 from tokenize_grpo import get_dataset
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 GRPO_DEFAULT_NUM_GENERATIONS = 2
@@ -333,6 +328,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Ensure consistent padding side for causal LMs (matches validator)
+    tokenizer.padding_side = "left"  # Left padding for causal LMs
 
     # max_length = get_max_length_config()
     # if "max_length" in train_request:
@@ -449,6 +446,13 @@ def main():
 
     max_steps = train_request.get("max_steps", -1)
     log_info(f"max_steps: {max_steps}")
+    
+    total_steps_all_epochs = total_steps_per_epoch * training_args.num_train_epochs
+    log_info(f"total_steps_per_epoch: {total_steps_per_epoch}; total_steps_all_epochs: {total_steps_all_epochs}")
+    
+    checking_step = train_request.get("checking_step", -1)
+    if checking_step >= total_steps_per_epoch:
+        checking_step = total_steps_per_epoch - 2
 
     has_extra_column = STANDARD_GRPO_EXTRA_COLUMN in train_ds.column_names
 
@@ -469,12 +473,21 @@ def main():
                 train_request["submission_dir"],
                 training_args.output_dir,
                 train_request["model_name"],
-                max_steps
-            )
+                max_steps,
+                checking_step=checking_step,
+                total_steps_all_epochs=total_steps_all_epochs,
+                end_time=train_request["end_time"],
+                checking_mode=train_request.get("checking_mode", "none")
+            ),
+            EarlyStoppingCallback(patience=300, min_delta=0.0001)
         ],
     )
 
-    trainer.train()
+    # Automatically resume from last checkpoint if one exists
+    last_checkpoint = get_last_checkpoint(training_args.output_dir)
+    if last_checkpoint:
+        log_info(f"Resuming from checkpoint: {last_checkpoint}")
+    trainer.train(resume_from_checkpoint=last_checkpoint if last_checkpoint else None)
     
     if is_main_process(LOCAL_RANK):
         with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:
