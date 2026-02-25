@@ -14,6 +14,7 @@ from transformers.trainer_utils import is_main_process
 import wandb
 import torch
 from state_manager import get_state, set_state
+import re
 MAX_TRIES = 9
 
 
@@ -76,13 +77,30 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.skip_full_eval_threshold = 1.1  # Skip full eval if subset loss > best * this
         
         # Adaptive settings: make features configurable via env vars
+        # Auto-detect small models and adjust settings automatically
+        is_small_model = self._is_small_model(original_model_name)
+        is_specialized_model = self._is_specialized_model(original_model_name)
+        
         # Generalization penalty: adaptive based on model size (smaller models need less penalty)
-        self.use_generalization_score = os.getenv("USE_GENERALIZATION_SCORE", "1") == "1"
-        self.overfitting_penalty_factor = float(os.getenv("OVERFITTING_PENALTY_FACTOR", "0.3"))
+        # For small models (< 2B), use eval_loss directly or reduce penalty significantly
+        if is_small_model or is_specialized_model:
+            default_use_gen_score = "0"  # Disable for small/specialized models
+            default_penalty_factor = "0.15"  # Half penalty if enabled
+            default_interpolation = "0"  # Disable interpolation for small models
+            print(f"ADAPTIVE: Detected small/specialized model '{original_model_name}', using conservative settings", flush=True)
+        else:
+            default_use_gen_score = "1"
+            default_penalty_factor = "0.3"
+            default_interpolation = "1"
+        
+        self.use_generalization_score = os.getenv("USE_GENERALIZATION_SCORE", default_use_gen_score) == "1"
+        self.overfitting_penalty_factor = float(os.getenv("OVERFITTING_PENALTY_FACTOR", default_penalty_factor))
         # Checkpoint interpolation: can be disabled for models that don't benefit
-        self.enable_checkpoint_interpolation = os.getenv("ENABLE_CHECKPOINT_INTERPOLATION", "1") == "1"
+        self.enable_checkpoint_interpolation = os.getenv("ENABLE_CHECKPOINT_INTERPOLATION", default_interpolation) == "1"
         # Use eval_loss directly if generalization score is disabled
         self.use_eval_loss_directly = not self.use_generalization_score
+        
+        print(f"ADAPTIVE Settings for '{original_model_name}': use_gen_score={self.use_generalization_score}, penalty_factor={self.overfitting_penalty_factor}, interpolation={self.enable_checkpoint_interpolation}", flush=True)
         
     def compute_loss(self, state: TrainerState, metrics):
         return metrics.get("eval_loss", None)
@@ -419,7 +437,46 @@ class CustomEvalSaveCallback(TrainerCallback):
                 else:
                     current_best_score = self.best_checkpoint_info["loss"]
                     print(f" At step: {state.global_step} The eval_loss: {eval_loss:.6f} is not better than current best: {current_best_score:.6f}, update_best_checkpoint={self.update_best_checkpoint}", flush=True)
-            
+    
+    def _is_small_model(self, model_name: str) -> bool:
+        """Detect if model is small (< 2B parameters)"""
+        if not model_name:
+            return False
+        
+        # Check for explicit size indicators in model name
+        # Patterns like "1.3B", "1.5B", "1.7B", "1.3b", etc.
+        size_match = re.search(r"(\d+\.?\d*)\s*[bB]", model_name)
+        if size_match:
+            size_value = float(size_match.group(1))
+            if size_value < 2.0:  # Less than 2B
+                return True
+        
+        # Check for known small models
+        small_model_patterns = [
+            r"tiny", r"small", r"smol", r"mini", r"neo-1\.3", r"neo-125m",
+            r"qwen2\.5-1\.5", r"1\.3b", r"1\.5b", r"1\.7b"
+        ]
+        model_lower = model_name.lower()
+        for pattern in small_model_patterns:
+            if re.search(pattern, model_lower):
+                return True
+        
+        return False
+    
+    def _is_specialized_model(self, model_name: str) -> bool:
+        """Detect if model is specialized (e.g., sqlcoder, code models)"""
+        if not model_name:
+            return False
+        
+        specialized_patterns = [
+            r"sqlcoder", r"code", r"sql", r"coder", r"defog"
+        ]
+        model_lower = model_name.lower()
+        for pattern in specialized_patterns:
+            if re.search(pattern, model_lower):
+                return True
+        
+        return False
 
     def on_save(self, args, state: TrainerState, control: TrainerControl, **kwargs):
         
@@ -731,11 +788,23 @@ class EarlyStoppingCallback(TrainerCallback):
     Works with both standard eval_loss and GRPO's eval_reward (negated).
     ADAPTIVE: Can be disabled or made less aggressive via env vars.
     """
-    def __init__(self, patience: int = 300, min_delta: float = 0.0001):
+    def __init__(self, patience: int = 300, min_delta: float = 0.0001, model_name: str = None):
         # ADAPTIVE: Make early stopping configurable - can be disabled or less aggressive
-        self.enabled = os.getenv("ENABLE_EARLY_STOPPING", "1") == "1"
+        # Auto-detect small models and use less aggressive settings
+        is_small = self._is_small_model(model_name) if model_name else False
+        is_specialized = self._is_specialized_model(model_name) if model_name else False
+        
+        if is_small or is_specialized:
+            default_enabled = "0"  # Disable for small/specialized models
+            default_patience = "500"  # Higher patience if enabled
+            print(f"ADAPTIVE: Detected small/specialized model '{model_name}', using conservative early stopping", flush=True)
+        else:
+            default_enabled = "1"
+            default_patience = str(patience)
+        
+        self.enabled = os.getenv("ENABLE_EARLY_STOPPING", default_enabled) == "1"
         # Increase patience for smaller models that need more training
-        self.patience = int(os.getenv("EARLY_STOPPING_PATIENCE", str(patience)))
+        self.patience = int(os.getenv("EARLY_STOPPING_PATIENCE", default_patience))
         self.min_delta = float(os.getenv("EARLY_STOPPING_MIN_DELTA", str(min_delta)))
         self.best_loss = None
         self.wait = 0
@@ -744,6 +813,36 @@ class EarlyStoppingCallback(TrainerCallback):
             print(f"Early stopping is DISABLED (ENABLE_EARLY_STOPPING=0)", flush=True)
         else:
             print(f"Early stopping enabled: patience={self.patience}, min_delta={self.min_delta}", flush=True)
+    
+    def _is_small_model(self, model_name: str) -> bool:
+        """Detect if model is small (< 2B parameters)"""
+        if not model_name:
+            return False
+        size_match = re.search(r"(\d+\.?\d*)\s*[bB]", model_name)
+        if size_match:
+            size_value = float(size_match.group(1))
+            if size_value < 2.0:
+                return True
+        small_model_patterns = [
+            r"tiny", r"small", r"smol", r"mini", r"neo-1\.3", r"neo-125m",
+            r"qwen2\.5-1\.5", r"1\.3b", r"1\.5b", r"1\.7b"
+        ]
+        model_lower = model_name.lower()
+        for pattern in small_model_patterns:
+            if re.search(pattern, model_lower):
+                return True
+        return False
+    
+    def _is_specialized_model(self, model_name: str) -> bool:
+        """Detect if model is specialized (e.g., sqlcoder, code models)"""
+        if not model_name:
+            return False
+        specialized_patterns = [r"sqlcoder", r"code", r"sql", r"coder", r"defog"]
+        model_lower = model_name.lower()
+        for pattern in specialized_patterns:
+            if re.search(pattern, model_lower):
+                return True
+        return False
     
     def on_evaluate(self, args, state, control, metrics, **kwargs):
         # ADAPTIVE: Skip early stopping if disabled
