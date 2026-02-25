@@ -377,8 +377,6 @@ def main():
         args.task_type == TaskType.INSTRUCTTEXTTASK.value
         or args.task_type == TaskType.CHATTASK.value
     ):
-        if args.task_type == TaskType.INSTRUCTTEXTTASK.value:
-            train_info["reg_ratio"] = 1.35494
         train_info = get_instruct_training_json(train_info)
         tokenize_cmd = (
             f"/workspace/axo_py/bin/python tokenize_instruct.py {request_path}"
