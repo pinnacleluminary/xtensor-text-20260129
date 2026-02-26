@@ -5,35 +5,45 @@ Standalone script for text model training (InstructText, DPO, and GRPO)
 
 import argparse
 import asyncio
-import copy
 import json
 import os
-import re
 import shutil
+import copy
 import subprocess
 import sys
-import time
-from datetime import datetime, timedelta, timezone
+import uuid
+import re
+import time 
+from datetime import datetime, timezone, timedelta
 
-import numpy as np
+import yaml
+from transformers import AutoTokenizer
 from state_manager import get_state, set_state
+import numpy as np
+
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 sys.path.append(project_root)
 
-import pathlib
-
-import lr_utils
 import train_cst
-import training_paths as train_paths
+from core.config.config_handler import create_dataset_entry
+from core.config.config_handler import save_config
+from core.config.config_handler import update_flash_attention
+from core.dataset_utils import adapt_columns_for_dpo_dataset
+from core.dataset_utils import adapt_columns_for_grpo_dataset
+from core.models.utility_models import DpoDatasetType
+from core.models.utility_models import FileFormat
+from core.models.utility_models import GrpoDatasetType
+from core.models.utility_models import InstructTextDatasetType
 from core.models.utility_models import TaskType
+import training_paths as train_paths
+from instruct_config import get_training_json as get_instruct_training_json
 from dpo_config import get_training_json as get_dpo_training_json
 from grpo_config import get_training_json as get_grpo_training_json
-from instruct_config import get_training_json as get_instruct_training_json
-from grpo_env_config import get_training_json as get_env_training_json
+import pathlib
 from transformers import AutoConfig
-
+import lr_utils
 
 def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
     # print(f"Running command: {cmd}", flush=True)
@@ -135,9 +145,6 @@ def run_training(
     retries: int,
     task_type: str,
     expected_repo_name: str,
-    wandb_mode: str = "offline",
-    wandb_project: str = None,
-    wandb_entity: str = None,
 ):
     for i in range(retries):
         print(
@@ -184,23 +191,10 @@ def run_training(
                 f.write("STARTING TRAINING")
 
         training_env_vars = {
-            "WANDB_MODE": wandb_mode,
+            "WANDB_MODE": "offline",
             "WANDB_RUN_ID": f"{task_id}_{expected_repo_name}",
             "WANDB_NAME": f"{task_id}_{expected_repo_name}",
         }
-        
-        # Add API key - wandb expects WANDB_API_KEY
-        # Check both WANDB_API_KEY and WANDB_TOKEN (for backwards compatibility)
-        wandb_token = os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_TOKEN")
-        if wandb_token:
-            training_env_vars["WANDB_API_KEY"] = wandb_token
-        
-        # Add project and entity for online mode
-        if wandb_mode == "online":
-            if wandb_project:
-                training_env_vars["WANDB_PROJECT"] = wandb_project
-            if wandb_entity:
-                training_env_vars["WANDB_ENTITY"] = wandb_entity
 
         run_cmd_with_log(train_cmd, log_path, env_vars=training_env_vars)
         # check if training is successfully here so we can break the loop; if output_dir contains file: "successs.txt" return true
@@ -270,7 +264,7 @@ def main():
     parser.add_argument(
         "--task-type",
         required=True,
-        choices=["InstructTextTask", "DpoTask", "GrpoTask", "ChatTask", "EnvTask"],
+        choices=["InstructTextTask", "DpoTask", "GrpoTask", "ChatTask"],
         help="Type of task",
     )
     parser.add_argument(
@@ -302,39 +296,10 @@ def main():
     )
 
     parser.add_argument(
-        "--reg-ratio", type=float, help="Reg ratio to use for training", default=1.0
-    )
-    parser.add_argument(
-        "--wandb-mode",
-        type=str,
-        choices=["offline", "online", "disabled"],
-        help="Wandb mode: offline (default), online, or disabled",
-        default="offline",
-    )
-    parser.add_argument(
-        "--wandb-project",
-        type=str,
-        help="Wandb project name (required for online mode)",
-        default=None,
-    )
-    parser.add_argument(
-        "--wandb-entity",
-        type=str,
-        help="Wandb entity/team name (optional for online mode)",
-        default=None,
+        "--reg-ratio", type=float, help="Reg ratio to use for training", default=1.24383
     )
 
     args = parser.parse_args()
-    
-    # Validate wandb configuration for online mode
-    if args.wandb_mode == "online" and not args.wandb_project:
-        args.wandb_project = "Gradients-On-Demand"
-        print(
-            f"Info: --wandb-mode is set to 'online' but --wandb-project not provided. "
-            f"Using default project: '{args.wandb_project}'",
-            flush=True,
-        )
-    
     original_model_name = args.model
     original_task_type = args.task_type
 
@@ -427,11 +392,6 @@ def main():
         train_info = get_grpo_training_json(train_info)
         tokenize_cmd = f"python tokenize_grpo.py {request_path}"
         train_cmd = train_info["run_cmd"]
-
-    elif args.task_type == TaskType.ENVIRONMENTTASK.value:
-        train_info = get_env_training_json(train_info)
-        tokenize_cmd = ""
-        train_cmd = train_info["run_cmd"]
     else:
         raise ValueError(f"Task type {args.task_type} not supported")
 
@@ -439,10 +399,9 @@ def main():
     with open(request_path, "w") as f:
         json.dump(train_info, f, indent=4, ensure_ascii=False)
 
-    if not args.task_type == TaskType.ENVIRONMENTTASK.value:
-        run_cmd_with_log(
-            tokenize_cmd, os.path.join(ds_folder, f"tokenize_{args.task_id}.log")
-        )
+    run_cmd_with_log(
+        tokenize_cmd, os.path.join(ds_folder, f"tokenize_{args.task_id}.log")
+    )
 
     original_train_cmd = train_cmd
     train_success = False
@@ -460,7 +419,7 @@ def main():
         train_cmd = original_train_cmd  # will replace based on the state later
         c_train_info = copy.deepcopy(train_info)
         final_output_dir = None
-        if args.task_type == TaskType.GRPOTASK.value or args.task_type == TaskType.ENVIRONMENTTASK.value:
+        if args.task_type == TaskType.GRPOTASK.value:
             state["mode"] = "finish" # do not run this for GRPO task
             c_train_info["train_request"]["checking_mode"] = "none"
         else:
@@ -525,17 +484,11 @@ def main():
                 args.retries,
                 args.task_type,
                 args.expected_repo_name,
-                args.wandb_mode,
-                args.wandb_project,
-                args.wandb_entity,
             )
             time.sleep(5)
             if not success:
                 print(f"Training failed for task {args.task_id} at count={count}", flush=True)
                 break 
-            else:
-                print(f"Training successfully done for task {args.task_id} at count={count}", flush=True)
-                break
         
         count += 1
 

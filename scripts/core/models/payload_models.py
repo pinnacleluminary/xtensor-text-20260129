@@ -22,7 +22,6 @@ from core.models.utility_models import TaskMinerResult
 from core.models.utility_models import TaskStatus
 from core.models.utility_models import TaskType
 from core.models.utility_models import TextDatasetType
-from core.models.utility_models import EnvironmentDatasetType
 from validator.core.models import AllNodeStats
 
 
@@ -64,16 +63,6 @@ class TrainRequestGrpo(TrainRequest):
         min_length=1,
     )
     dataset_type: GrpoDatasetType
-    file_format: FileFormat
-    
-    
-class TrainRequestEnvironment(TrainRequest):
-    dataset: str = Field(
-        ...,
-        description="Path to the dataset file or Hugging Face dataset name",
-        min_length=1,
-    )
-    dataset_type: EnvironmentDatasetType
     file_format: FileFormat
 
 
@@ -227,27 +216,6 @@ class NewTaskRequestChat(NewTaskRequest):
             "chat_content_field",
             "chat_user_reference",
             "chat_assistant_reference",
-        ]
-        for field in string_fields:
-            if field in values and isinstance(values[field], str):
-                values[field] = values[field].strip() or None
-        return values
-    
-    
-class NewTaskRequestEnvironment(NewTaskRequest):
-    environment_name: str = Field(..., description="The name of the specific environment we are training for.", examples=["alfworld"])
-
-
-    ds_repo: str = Field(..., description="The repository for the dataset", examples=["Magpie-Align/Magpie-Pro-300K-Filtered"])
-    model_repo: str = Field(..., description="The repository for the model", examples=["Qwen/Qwen2.5-Coder-32B-Instruct"])
-
-    # Turn off protected namespace for model
-    model_config = ConfigDict(protected_namespaces=())
-
-    @model_validator(mode="before")
-    def convert_empty_strings(cls, values):
-        string_fields = [
-            "environment_name",
         ]
         for field in string_fields:
             if field in values and isinstance(values[field], str):
@@ -440,24 +408,6 @@ class InstructTextTaskDetails(TaskDetails):
     model_config = ConfigDict(protected_namespaces=())
 
 
-class ChatTaskDetails(TaskDetails):
-    task_type: TaskType = TaskType.CHATTASK
-    base_model_repository: str
-    ds_repo: str
-
-    chat_template: str = Field(..., description="The chat template used", examples=["chatml"])
-    chat_column: str | None = Field(None, description="The column name for the chat conversations", examples=["conversations"])
-    chat_role_field: str = Field(..., description="The column name to specify the role in the conversation ", examples=["from"])
-    chat_content_field: str = Field(..., description="The column name to specify the text content", examples=["value"])
-    chat_user_reference: str | None = Field(None, description="The column name to specify the user", examples=["user"])
-    chat_assistant_reference: str | None = Field(
-        None, description="The column name to specify the assistant", examples=["assistant"]
-    )
-
-    # Turn off protected namespace for model
-    model_config = ConfigDict(protected_namespaces=())
-
-
 class DpoTaskDetails(TaskDetails):
     task_type: TaskType = TaskType.DPOTASK
     base_model_repository: str
@@ -485,16 +435,6 @@ class GrpoTaskDetails(TaskDetails):
 
     field_prompt: str = Field(..., description="The column name for the prompt", examples=["prompt"])
     reward_functions: list[RewardFunction]
-
-    # Turn off protected namespace for model
-    model_config = ConfigDict(protected_namespaces=())
-    
-    
-class EnvironmentTaskDetails(TaskDetails):
-    task_type: TaskType = TaskType.ENVIRONMENTTASK
-    environment_name: str
-    base_model_repository: str
-    ds_repo: str
 
     # Turn off protected namespace for model
     model_config = ConfigDict(protected_namespaces=())
@@ -544,4 +484,4 @@ class TournamentGpuRequirementsResponse(BaseModel):
 
 
 # Type alias for task details types
-AnyTypeTaskDetails = InstructTextTaskDetails | ChatTaskDetails | ImageTaskDetails | DpoTaskDetails | GrpoTaskDetails | EnvironmentTaskDetails
+AnyTypeTaskDetails = InstructTextTaskDetails | ImageTaskDetails | DpoTaskDetails | GrpoTaskDetails

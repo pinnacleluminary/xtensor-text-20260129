@@ -108,6 +108,12 @@ def print_trainable_parameters(model):
     )
 
 
+def get_max_length_config():
+    config_path = "test_axolotl.yml"
+    with open(config_path, "r") as file:
+        config_dict = yaml.safe_load(file)
+    return config_dict["sequence_len"]
+
 
 def supports_extra_data(func: Callable) -> bool:
     try:
