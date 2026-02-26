@@ -146,7 +146,6 @@ def run_training(
     task_type: str,
     expected_repo_name: str,
 ):
-    # Clear GPU cache before starting training to avoid memory fragmentation
     try:
         import torch
         if torch.cuda.is_available():
@@ -155,10 +154,6 @@ def run_training(
         pass
     
     for i in range(retries):
-        print(
-            f"************* Training attempt {i+1}/{retries} for task {task_id}*************",
-            flush=True,
-        )
         if i > 0:  # there was something wrong so we will reduce the batch_size
             # first check if the training is OOM
             if os.path.exists(log_path):
@@ -442,7 +437,7 @@ def main():
         "--reg-ratio-method",
         type=str,
         choices=["experimental", "sqrt_batch", "linear_batch", "adaptive"],
-        help="Method to calculate reg_ratio: 'experimental' (default 1.24383), 'sqrt_batch' (sqrt batch scaling), 'linear_batch' (linear batch scaling), 'adaptive' (multi-factor)",
+        help="Method to calculate reg_ratio",
         default="experimental"
     )
 
@@ -453,16 +448,54 @@ def main():
     print(f"REG_RATIO CALCULATION", flush=True)
     print(f"{'='*60}", flush=True)
     if args.reg_ratio is None:
-        # Note: For dynamic calculation, batch_size and model_params would need to be determined
-        # from config files. For now, use the experimental default.
-        # You can enhance this by reading from config after it's created.
-        print(f"Calculating reg_ratio using method: '{args.reg_ratio_method}'", flush=True)
+        # Calculate reg_ratio using all available methods and select optimal
+        print(f"Calculating reg_ratio using ALL methods and selecting optimal value", flush=True)
         print(f"Task type: {args.task_type}", flush=True)
-        args.reg_ratio = calculate_reg_ratio(
-            task_type=args.task_type,
-            method=args.reg_ratio_method
-        )
-        print(f"\n[OK] Final calculated reg_ratio: {args.reg_ratio:.6f}", flush=True)
+        
+        # Get model info if available for better calculations
+        model_params = None
+        batch_size = None
+        base_lr = None
+        try:
+            from model_utility import get_model_num_params
+            model_path = str(train_paths.get_text_base_model_path(args.model))
+            model_params = get_model_num_params(args.model, model_path)
+            if model_params:
+                print(f"  Model params: {model_params:,}", flush=True)
+        except Exception as e:
+            print(f"  Could not get model params (will use defaults): {e}", flush=True)
+        
+        # Calculate reg_ratio for all methods
+        all_methods = ["experimental", "sqrt_batch", "linear_batch", "adaptive"]
+        reg_ratios = {}
+        
+        print(f"\n  Calculating reg_ratio for all methods:", flush=True)
+        for method in all_methods:
+            try:
+                reg_ratio_value = calculate_reg_ratio(
+                    task_type=args.task_type,
+                    batch_size=batch_size,
+                    model_params=model_params,
+                    base_lr=base_lr,
+                    method=method
+                )
+                reg_ratios[method] = reg_ratio_value
+                print(f"    {method:15s}: {reg_ratio_value:.6f}", flush=True)
+            except Exception as e:
+                print(f"    {method:15s}: ERROR - {e}", flush=True)
+        
+        # Select optimal reg_ratio
+        if not reg_ratios:
+            args.reg_ratio = 1.24383
+        else:
+            # Strategy: Prefer adaptive if available (most sophisticated), otherwise use median
+            if "adaptive" in reg_ratios:
+                args.reg_ratio = reg_ratios["adaptive"]
+            else:
+                # Use median of all calculated values (robust to outliers)
+                values = sorted(reg_ratios.values())
+                median_idx = len(values) // 2
+                args.reg_ratio = values[median_idx] if len(values) % 2 == 1 else (values[median_idx - 1] + values[median_idx]) / 2
     else:
         print(f"Using explicitly provided reg_ratio: {args.reg_ratio:.6f}", flush=True)
     print(f"{'='*60}\n", flush=True)

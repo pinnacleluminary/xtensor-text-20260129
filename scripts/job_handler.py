@@ -197,6 +197,40 @@ def _load_and_modify_config_diffusion(job: DiffusionJob) -> dict:
     return config
 
 
+def create_job_diffusion(
+    job_id: str,
+    model: str,
+    dataset_zip: str,
+    model_type: ImageModelType,
+    expected_repo_name: str | None
+):
+    return DiffusionJob(
+        job_id=job_id,
+        model=model,
+        dataset_zip=dataset_zip,
+        model_type=model_type,
+        expected_repo_name=expected_repo_name,
+    )
+
+
+def create_job_text(
+    job_id: str,
+    dataset: str,
+    model: str,
+    dataset_type: TextDatasetType,
+    file_format: FileFormat,
+    expected_repo_name: str | None,
+):
+    return TextJob(
+        job_id=job_id,
+        dataset=dataset,
+        model=model,
+        dataset_type=dataset_type,
+        file_format=file_format,
+        expected_repo_name=expected_repo_name,
+    )
+
+
 def start_tuning_container_diffusion(job: DiffusionJob):
     logger.info("=" * 80)
     logger.info("STARTING THE DIFFUSION TUNING CONTAINER")
@@ -518,3 +552,10 @@ def _update_repo_visibility_with_retry(hf_api: HfApi, repo_id: str, token: str):
             logger.warning(f"Network error updating repo visibility for {repo_id}, will retry: {e}")
             raise
         raise
+
+        if "container" in locals():
+            try:
+                container.remove(force=True)
+                logger.info("Container removed")
+            except Exception as e:
+                logger.warning(f"Failed to remove container: {e}")

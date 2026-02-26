@@ -7,11 +7,11 @@ from transformers import (
     TrainerControl,
 )
 import os
-from typing import Callable, Optional, Dict
+from typing import Callable, Optional
+import time
 import shutil
 import json
 from transformers.trainer_utils import is_main_process
-import wandb
 import torch
 from state_manager import get_state, set_state
 MAX_TRIES = 9
@@ -555,7 +555,6 @@ class CustomEvalSaveCallback(TrainerCallback):
                         try:
                             shutil.rmtree(self.submission_dir, ignore_errors=True)
                         except Exception as err:
-                            print(f"Warning: Error removing submission directory (ignoring): {err}", flush=True)
                             try:
                                 import stat
                                 def handle_remove_readonly(func, path, exc):
@@ -599,12 +598,6 @@ class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
             eval_loss = - eval_loss
             
         return eval_loss
-    
-    def penalize_eval_loss(self, eval_loss: float):
-        if eval_loss < 0:
-            return eval_loss / 3
-        else:
-            return eval_loss * 3
 
 
 def check_remaining_time_less_than_minutes(end_time: str, minutes: int) -> bool: 
@@ -709,18 +702,222 @@ def resize_if_needed(model_name, model, token_nums):
         pass
 
 
-def init_wandb(train_request: Dict):
-    # set wandb_mode=offline; do not upload the data to wandb export WANDB_MODE=offline
-    return True
-    task_id = train_request["task_id"]
-    expected_repo_name = train_request["expected_repo_name"]
-    os.environ["WANDB_MODE"] = "offline"
-    os.environ["WANDB_DIR"] = train_request["wandb_log_dir"]
-    os.environ["WANDB_RUN_ID"] = f"{task_id}_{expected_repo_name}"
-    os.environ["WANDB_NAME"] = f"{task_id}_{expected_repo_name}"
-    if is_main_process(LOCAL_RANK):
-        os.makedirs(train_request["wandb_log_dir"], exist_ok=True)
-    return True
+
+
+class ProgressiveBatchSizeCallback(TrainerCallback):
+    def __init__(
+        self,
+        initial_batch_size: int = 16,
+        max_batch_size: int = 128,
+        stability_steps: int = 50,
+        min_speed_improvement: float = 0.05,  # 5% minimum speed improvement
+        eval_accuracy_drop_threshold: float = 0.01,  # 1% accuracy drop threshold
+        batch_size_multiplier: float = 1.5,  # Increase by 50% each time
+        memory_safety_margin: float = 0.9,  # Use 90% of available memory
+    ):
+        self.initial_batch_size = initial_batch_size
+        self.max_batch_size = max_batch_size
+        self.stability_steps = stability_steps
+        self.min_speed_improvement = min_speed_improvement
+        self.eval_accuracy_drop_threshold = eval_accuracy_drop_threshold
+        self.batch_size_multiplier = batch_size_multiplier
+        self.memory_safety_margin = memory_safety_margin
+        
+        # State tracking
+        self.current_batch_size = None
+        self.base_learning_rate = None
+        self.stability_check_start_step = None
+        self.previous_losses = []
+        self.previous_speeds = []  # Steps per second
+        self.previous_eval_losses = []
+        self.best_eval_loss = None
+        self.last_step_time = None
+        self.stable_training_confirmed = False
+        self.scaling_active = False
+        
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Initialize batch size scaling monitoring at training start"""
+        if not is_main_process(LOCAL_RANK):
+            return control
+        
+        # Note: Batch size should be set before trainer creation (done in training scripts)
+        # This callback monitors training and logs recommendations for batch size scaling
+        self.current_batch_size = args.per_device_train_batch_size
+        self.base_learning_rate = args.learning_rate
+        self.stability_check_start_step = state.global_step
+        self.scaling_active = True
+        
+        print(f"ProgressiveBatchSize: Monitoring initialized with batch_size={self.current_batch_size}, lr={self.base_learning_rate}", flush=True)
+        print(f"ProgressiveBatchSize: Will monitor training stability and recommend batch size increases", flush=True)
+        return control
+    
+    def _check_training_stability(self, state) -> bool:
+        """Check if training is stable (loss is decreasing smoothly)"""
+        if len(self.previous_losses) < self.stability_steps:
+            return False
+        
+        # Check if loss is decreasing (last 20% of stability window)
+        recent_losses = self.previous_losses[-int(self.stability_steps * 0.2):]
+        if len(recent_losses) < 2:
+            return False
+        
+        # Loss should be decreasing or stable (not increasing significantly)
+        loss_trend = recent_losses[-1] - recent_losses[0]
+        if loss_trend > 0.1:  # Loss increased by more than 0.1
+            return False
+        
+        # Check for NaN or Inf
+        if any(not isinstance(l, float) or not (l == l) for l in recent_losses):
+            return False
+        
+        return True
+    
+    def _check_memory_usage(self) -> bool:
+        """Check if we're near memory limit"""
+        if not torch.cuda.is_available():
+            return False
+        
+        try:
+            memory_allocated = torch.cuda.memory_allocated(LOCAL_RANK) / (1024**3)  # GB
+            memory_reserved = torch.cuda.memory_reserved(LOCAL_RANK) / (1024**3)  # GB
+            memory_total = torch.cuda.get_device_properties(LOCAL_RANK).total_memory / (1024**3)  # GB
+            
+            memory_usage_ratio = memory_reserved / memory_total
+            safe_memory_limit = self.memory_safety_margin
+            
+            if memory_usage_ratio >= safe_memory_limit:
+                print(f"ProgressiveBatchSize: Memory usage {memory_usage_ratio:.2%} >= {safe_memory_limit:.2%}, near limit", flush=True)
+                return True
+        except Exception as e:
+            print(f"ProgressiveBatchSize: Error checking memory: {e}", flush=True)
+        
+        return False
+    
+    def _calculate_speed_improvement(self) -> Optional[float]:
+        """Calculate speed improvement from batch size increase"""
+        if len(self.previous_speeds) < 2:
+            return None
+        
+        # Compare average speed of last batch size vs previous
+        # This is a simplified check - in practice, we'd track speeds per batch size
+        recent_speeds = self.previous_speeds[-10:] if len(self.previous_speeds) >= 10 else self.previous_speeds
+        if len(recent_speeds) < 2:
+            return None
+        
+        avg_speed = sum(recent_speeds) / len(recent_speeds)
+        # For simplicity, assume speed scales linearly with batch size (in practice it's sublinear)
+        # We'll use a heuristic: if we doubled batch size, we expect >50% speedup
+        return avg_speed
+    
+    def _check_eval_accuracy_drop(self) -> bool:
+        """Check if validation accuracy has dropped"""
+        if len(self.previous_eval_losses) < 2:
+            return False
+        
+        if self.best_eval_loss is None:
+            return False
+        
+        current_eval_loss = self.previous_eval_losses[-1]
+        # If eval loss increased significantly, accuracy dropped
+        if current_eval_loss > self.best_eval_loss * (1 + self.eval_accuracy_drop_threshold):
+            print(f"ProgressiveBatchSize: Eval loss increased from {self.best_eval_loss:.6f} to {current_eval_loss:.6f}", flush=True)
+            return True
+        
+        return False
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Monitor training and adjust batch size"""
+        if not is_main_process(LOCAL_RANK) or not self.scaling_active:
+            return control
+        
+        # Track training loss
+        if state.log_history:
+            last_log = state.log_history[-1]
+            if "loss" in last_log:
+                self.previous_losses.append(last_log["loss"])
+                # Keep only recent losses for stability check
+                if len(self.previous_losses) > self.stability_steps * 2:
+                    self.previous_losses = self.previous_losses[-self.stability_steps:]
+        
+        # Track training speed (steps per second)
+        if self.last_step_time is not None:
+            time_diff = datetime.datetime.now() - self.last_step_time
+            if time_diff.total_seconds() > 0:
+                speed = 1.0 / time_diff.total_seconds()
+                self.previous_speeds.append(speed)
+                if len(self.previous_speeds) > 100:
+                    self.previous_speeds = self.previous_speeds[-100:]
+        self.last_step_time = datetime.datetime.now()
+        
+        # Check if we should stop scaling
+        if self._check_memory_usage():
+            print(f"ProgressiveBatchSize: Stopping scaling - near memory limit", flush=True)
+            self.scaling_active = False
+            return control
+        
+        if self._check_eval_accuracy_drop():
+            print(f"ProgressiveBatchSize: Stopping scaling - validation accuracy dropped", flush=True)
+            self.scaling_active = False
+            return control
+        
+        # Check training stability before first increase
+        if not self.stable_training_confirmed:
+            if state.global_step >= self.stability_check_start_step + self.stability_steps:
+                if self._check_training_stability(state):
+                    self.stable_training_confirmed = True
+                    print(f"ProgressiveBatchSize: Training stability confirmed at step {state.global_step}", flush=True)
+                else:
+                    print(f"ProgressiveBatchSize: Training not stable yet, waiting...", flush=True)
+            return control
+        
+        # Monitor and log recommendations for batch size increases
+        # Note: Actual batch size changes require restarting training with new parameters
+        steps_since_last_check = state.global_step - self.stability_check_start_step
+        if steps_since_last_check >= self.stability_steps and self.current_batch_size < self.max_batch_size:
+            # Calculate recommended new batch size
+            new_batch_size = int(self.current_batch_size * self.batch_size_multiplier)
+            new_batch_size = min(new_batch_size, self.max_batch_size)
+            
+            if new_batch_size > self.current_batch_size:
+                # Scale learning rate proportionally (linear scaling rule)
+                lr_scale = new_batch_size / self.current_batch_size
+                new_learning_rate = self.base_learning_rate * lr_scale
+                
+                print(f"ProgressiveBatchSize: RECOMMENDATION - Training is stable, could increase batch size", flush=True)
+                print(f"ProgressiveBatchSize:   Current: batch_size={self.current_batch_size}, lr={args.learning_rate:.8f}", flush=True)
+                print(f"ProgressiveBatchSize:   Recommended: batch_size={new_batch_size}, lr={new_learning_rate:.8f} (scale={lr_scale:.2f})", flush=True)
+                print(f"ProgressiveBatchSize:   Note: To apply, restart training with these new parameters", flush=True)
+                
+                # Track that we've made a recommendation (for future auto-restart implementation)
+                self.stability_check_start_step = state.global_step
+                self.stable_training_confirmed = False  # Need to confirm stability again
+                self.previous_losses = []  # Reset for new stability check
+                self.previous_speeds = []  # Reset speed tracking
+        
+        return control
+    
+    def on_evaluate(self, args, state, control, metrics, **kwargs):
+        """Track evaluation metrics"""
+        if not is_main_process(LOCAL_RANK):
+            return control
+        
+        eval_loss = metrics.get("eval_loss", None)
+        if eval_loss is None and state.log_history:
+            last_log_entry = state.log_history[-1]
+            eval_reward = last_log_entry.get("eval_reward", None)
+            if eval_reward is not None:
+                # For GRPO: negate reward to convert to loss
+                eval_loss = -eval_reward
+        
+        if eval_loss is not None:
+            self.previous_eval_losses.append(eval_loss)
+            if len(self.previous_eval_losses) > 20:
+                self.previous_eval_losses = self.previous_eval_losses[-20:]
+            
+            if self.best_eval_loss is None or eval_loss < self.best_eval_loss:
+                self.best_eval_loss = eval_loss
+        
+        return control
 
 
 class EarlyStoppingCallback(TrainerCallback):
