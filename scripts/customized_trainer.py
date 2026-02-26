@@ -88,8 +88,12 @@ class CustomEvalSaveCallback(TrainerCallback):
             # print(f"Checking the model at step: {state.global_step}", flush=True)
             # check the time so far to estimate the training time in total 
             my_state = get_state()
+            if "train" not in my_state or "start_time" not in my_state.get("train", {}):
+                print(f"Warning: Missing 'train' or 'start_time' in state, skipping time estimation", flush=True)
+                return control
             start_time_obj = datetime.datetime.strptime(my_state["train"]["start_time"], "%Y-%m-%d %H:%M:%S")
-            start_train_time_obj = datetime.datetime.strptime(my_state["train"]["start_train_time"], "%Y-%m-%d %H:%M:%S")
+            start_train_time_str = my_state["train"].get("start_train_time", my_state["train"]["start_time"])
+            start_train_time_obj = datetime.datetime.strptime(start_train_time_str, "%Y-%m-%d %H:%M:%S")
             
             log_content = f"Checking the model at step: {state.global_step}"
             now = datetime.datetime.now()
@@ -154,6 +158,8 @@ class CustomEvalSaveCallback(TrainerCallback):
         elif state.global_step == self.checking_step and self.checking_mode == "second_time": # at second time, we don't estimate the training time again, just save the current_loss
             log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"            
             my_state = get_state()
+            if "train" not in my_state:
+                my_state["train"] = {}
             current_loss = state.log_history[-1]["loss"]
             my_state["train"]["current_loss"] = current_loss
             
@@ -258,6 +264,8 @@ class CustomEvalSaveCallback(TrainerCallback):
             if state.global_step == self.checking_step and self.checking_mode == "second_time":
                 if eval_loss is not None:
                     my_state = get_state()
+                    if "train" not in my_state:
+                        my_state["train"] = {}
                     my_state["train"]["current_eval_loss"] = eval_loss
                     print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} at checking_step {state.global_step} for multi-run selection", flush=True)
                     

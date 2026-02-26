@@ -15,6 +15,7 @@ import uuid
 import re
 import time 
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 import yaml
 from transformers import AutoTokenizer
@@ -130,7 +131,7 @@ def get_error_type(log_path: str):
         return None
 
 
-def extract_output_dir(train_cmd: str) -> str:
+def extract_output_dir(train_cmd: str) -> Optional[str]:
     match = re.search(r"--output_dir\s+(.*?)\s+", train_cmd)
     if match:
         return match.group(1)
@@ -162,31 +163,38 @@ def run_training(
                     current_batch_size = extract_value_from_cmd(
                         train_cmd, "per_device_train_batch_size"
                     )
-                    current_batch_size = int(current_batch_size)
-                    if current_batch_size > 1:
-                        new_batch_size = current_batch_size // 2
-                        print(
-                            f"Reducing batch size from {current_batch_size} to {new_batch_size}",
-                            flush=True,
-                        )
-                        train_cmd = replace_args_in_cmd(
-                            train_cmd,
-                            "per_device_train_batch_size",
-                            str(new_batch_size),
-                        )
-                        # print(f"New train command: {train_cmd}", flush=True)
-                    else:
-                        print(f"batch size is 1, cannot reduce further", flush=True)
-                        if task_type == TaskType.GRPOTASK.value:
-                            # disable vllm
-                            train_cmd = replace_args_in_cmd(
-                                train_cmd, "use_vllm", "False"
+                    if current_batch_size:
+                        current_batch_size = int(current_batch_size)
+                        if current_batch_size > 1:
+                            new_batch_size = current_batch_size // 2
+                            print(
+                                f"OOM detected: Reducing batch size from {current_batch_size} to {new_batch_size} (ProgressiveBatchSizeCallback will handle increases during training)",
+                                flush=True,
                             )
-                            # print(f"disable VLLM {train_cmd}", flush=True)
+                            new_cmd = replace_args_in_cmd(
+                                train_cmd,
+                                "per_device_train_batch_size",
+                                str(new_batch_size),
+                            )
+                            if new_cmd is not None:
+                                train_cmd = new_cmd
+                            # print(f"New train command: {train_cmd}", flush=True)
+                        else:
+                            print(f"batch size is 1, cannot reduce further", flush=True)
+                            if task_type == TaskType.GRPOTASK.value:
+                                # disable vllm
+                                new_cmd = replace_args_in_cmd(
+                                    train_cmd, "use_vllm", "False"
+                                )
+                                if new_cmd is not None:
+                                    train_cmd = new_cmd
+                                # print(f"disable VLLM {train_cmd}", flush=True)
                 elif error_type == VLLM_OOM_ERROR:
                     if task_type == TaskType.GRPOTASK.value:
                         print(f"VLLM OOM error, disable VLLM", flush=True)
-                        train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                        new_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                        if new_cmd is not None:
+                            train_cmd = new_cmd
 
         # empty the log file if it exists
         if os.path.exists(log_path):
@@ -576,6 +584,9 @@ def main():
         "reg_ratio": args.reg_ratio,
         "find_lk_lr": True,
         "checking_mode": "first_time",
+        "use_progressive_batch_size": True,
+        "max_batch_size": 128,
+        "stability_steps": 50,
     }
 
     if (
@@ -635,6 +646,11 @@ def main():
                 c_train_info["train_request"]["checking_mode"] = "second_time"
                 n_runs = state["next_runs"]
                 if "lrs" not in state: # first time of continue
+                    if "train" not in state or "lr" not in state.get("train", {}):
+                        print(f"Error: Missing 'train' or 'lr' in state, cannot continue. State keys: {list(state.keys())}", flush=True)
+                        state["mode"] = "finish"
+                        set_state(state)
+                        break
                     current_lr = float(state["train"]["lr"])
                     state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
                     assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
@@ -646,7 +662,9 @@ def main():
                 if len(state["runs"]) < n_runs:
                     index = len(state["runs"])
                     current_lr = state["lrs"][index]
-                    train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
+                    new_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
+                    if new_cmd is not None:
+                        train_cmd = new_cmd
                 else: # the final run - continue training the best checkpoint to completion
                     # CRITICAL: Use eval_loss for selection if available, otherwise fall back to current_loss
                     # This is the key improvement - eval_loss is what matters for generalization
@@ -680,13 +698,17 @@ def main():
                 run_output_dir = final_output_dir
             else:
                 run_output_dir = output_dir + f"_{count}"
-            train_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
+            new_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
+            if new_cmd is not None:
+                train_cmd = new_cmd
             
             current_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_{count}.json")
             with open(current_request_path, "w") as f:
                 json.dump(c_train_info, f, indent=4, ensure_ascii=False)
             
-            train_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
+            new_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
+            if new_cmd is not None:
+                train_cmd = new_cmd
             
             state["train"] = {
                 "train_cmd": train_cmd,

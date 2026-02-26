@@ -9,9 +9,7 @@ os.environ["TMPDIR"] = "/workspace/tmp"
 def download_base_model(repo_id: str, save_root: str) -> str:
     model_name = repo_id.replace("/", "--")
     save_path = os.path.join(save_root, model_name)
-    print(f"Downloading model {repo_id} to {save_path}")
     if os.path.exists(save_path):
-        print(f"Model {repo_id} already exists at {save_path}. Skipping download.")
         return save_path
     else:
         has_safetensors, safetensors_path = is_safetensors_available(repo_id)
