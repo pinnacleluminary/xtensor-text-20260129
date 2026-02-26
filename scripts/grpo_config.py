@@ -20,14 +20,14 @@ GRPO_CONFIG = {
         "vllm_gpu_memory_utilization": 0.4,
     },
     "1_2_b": {
-        "lr": 5.7e-6,
+        "lr": 8e-6,
         "distributed": "ddp",
         "gpu_count": 1,
         "batch_size": 40,
         "vllm_gpu_memory_utilization": 0.4,
     },
     "2_4_b": {
-        "lr": 5.7e-6,
+        "lr": 8e-6,
         "distributed": "ddp",
         "gpu_count": 2,
         "batch_size": 42,
@@ -51,7 +51,7 @@ GRPO_CONFIG = {
         "vllm_gpu_memory_utilization": 0.4,
     },
     "6_9_b": {
-        "lr": 4.2753431e-6,
+        "lr": 6e-6,
         "distributed": "ddp",
         "gpu_count": 4,
         "batch_size": 24,

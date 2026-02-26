@@ -1,6 +1,5 @@
 import os
-from trainer_downloader import is_safetensors_available, download_from_huggingface
-from huggingface_hub import snapshot_download
+from trainer_downloader import is_safetensors_available, download_from_huggingface, _snapshot_download_with_retry
 import train_cst as cst
 import typer
 os.environ["HF_HOME"] = "/workspace/hf_cached/"
@@ -19,12 +18,16 @@ def download_base_model(repo_id: str, save_root: str) -> str:
         if has_safetensors and safetensors_path:
             return download_from_huggingface(repo_id, safetensors_path, save_path)
         else:
-            snapshot_download(
-                repo_id=repo_id,
-                repo_type="model",
-                local_dir=save_path,
-                local_dir_use_symlinks=False,
-            )
+            try:
+                _snapshot_download_with_retry(
+                    repo_id=repo_id,
+                    repo_type="model",
+                    local_dir=save_path,
+                    local_dir_use_symlinks=False,
+                )
+            except Exception as e:
+                print(f"Error downloading model {repo_id}: {e}", flush=True)
+                raise
             return save_path
 
 

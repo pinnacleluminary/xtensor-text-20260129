@@ -28,7 +28,7 @@ INSTRUCT_CONFIG = {
         "use_lora": False,
     },
     "1_2_b": {
-        "lr": 0.0001089328927586567,
+        "lr": 0.0001,
         "distributed": "ddp",
         "gpu_count": 1,
         "use_lora": False,

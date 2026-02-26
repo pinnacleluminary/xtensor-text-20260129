@@ -11,6 +11,12 @@ import yaml
 from docker.errors import DockerException
 from fiber.logging_utils import get_logger
 from huggingface_hub import HfApi
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception,
+)
 
 from core import constants as cst
 from core.config.config_handler import create_dataset_entry
@@ -33,6 +39,38 @@ from miner.utils import download_flux_unet
 
 
 logger = get_logger(__name__)
+
+# Network-related exceptions that should trigger retries
+NETWORK_EXCEPTIONS = (
+    ConnectionError,
+    TimeoutError,
+    OSError,
+)
+
+def is_network_error(exception):
+    """Check if exception is network-related"""
+    exception_str = str(exception).lower()
+    network_keywords = [
+        'name resolution',
+        'temporary failure',
+        'connection',
+        'timeout',
+        'max retries',
+        'network',
+        'dns',
+        'resolve',
+    ]
+    return any(keyword in exception_str for keyword in network_keywords)
+
+# Retry decorator for HuggingFace API calls
+hf_api_retry = retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+    retry=retry_if_exception(
+        lambda e: isinstance(e, NETWORK_EXCEPTIONS) or is_network_error(e)
+    ),
+    reraise=True,
+)
 
 
 @dataclass
@@ -157,40 +195,6 @@ def _load_and_modify_config_diffusion(job: DiffusionJob) -> dict:
     else:
         logger.error(f"Unknown model type: {job.model_type}")
     return config
-
-
-def create_job_diffusion(
-    job_id: str,
-    model: str,
-    dataset_zip: str,
-    model_type: ImageModelType,
-    expected_repo_name: str | None
-):
-    return DiffusionJob(
-        job_id=job_id,
-        model=model,
-        dataset_zip=dataset_zip,
-        model_type=model_type,
-        expected_repo_name=expected_repo_name,
-    )
-
-
-def create_job_text(
-    job_id: str,
-    dataset: str,
-    model: str,
-    dataset_type: TextDatasetType,
-    file_format: FileFormat,
-    expected_repo_name: str | None,
-):
-    return TextJob(
-        job_id=job_id,
-        dataset=dataset,
-        model=model,
-        dataset_type=dataset_type,
-        file_format=file_format,
-        expected_repo_name=expected_repo_name,
-    )
 
 
 def start_tuning_container_diffusion(job: DiffusionJob):
@@ -497,13 +501,20 @@ def start_tuning_container(job: TextJob):
     finally:
         repo = config.get("hub_model_id", None)
         if repo:
-            hf_api = HfApi(token=cst.HUGGINGFACE_TOKEN)
-            hf_api.update_repo_visibility(repo_id=repo, private=False, token=cst.HUGGINGFACE_TOKEN)
-            logger.info(f"Successfully made repository {repo} public")
-
-        if "container" in locals():
             try:
-                container.remove(force=True)
-                logger.info("Container removed")
+                hf_api = HfApi(token=cst.HUGGINGFACE_TOKEN)
+                _update_repo_visibility_with_retry(hf_api, repo, cst.HUGGINGFACE_TOKEN)
+                logger.info(f"Successfully made repository {repo} public")
             except Exception as e:
-                logger.warning(f"Failed to remove container: {e}")
+                logger.warning(f"Failed to update repository visibility for {repo}: {e}")
+
+@hf_api_retry
+def _update_repo_visibility_with_retry(hf_api: HfApi, repo_id: str, token: str):
+    """Wrapper for update_repo_visibility with retry logic"""
+    try:
+        hf_api.update_repo_visibility(repo_id=repo_id, private=False, token=token)
+    except Exception as e:
+        if is_network_error(e):
+            logger.warning(f"Network error updating repo visibility for {repo_id}, will retry: {e}")
+            raise
+        raise

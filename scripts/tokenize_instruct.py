@@ -216,11 +216,8 @@ def remove_empty_output_items(items: list):
     """Remove empty and low-quality output items with enhanced filtering"""
     result = []
     filtered_count = 0
-    # ADAPTIVE: Make quality filtering less aggressive - can be controlled via env var
-    use_aggressive_filtering = os.getenv("USE_AGGRESSIVE_QUALITY_FILTER", "0") == "1"
-    
     for item in items:
-        # Basic filtering (always applied)
+        # Basic filtering
         if "output" in item and not item["output"]:
             filtered_count += 1
             continue
@@ -247,28 +244,26 @@ def remove_empty_output_items(items: list):
             filtered_count += 1
             continue
         
-        # Enhanced quality filtering (only if aggressive filtering is enabled)
-        # This helps specialized models like sqlcoder that might have short but valid outputs
-        if use_aggressive_filtering:
-            output = item.get("output", "")
-            if output:
-                # Filter very short outputs (but be less strict)
-                if len(output) < 3:  # Reduced from 5 to 3
-                    filtered_count += 1
-                    continue
-                # Filter repetitive outputs (but be less strict)
-                if is_repetitive(output, threshold=0.3):  # Reduced from 0.5 to 0.3
-                    filtered_count += 1
-                    continue
-                # Filter low information content (but be less strict)
-                if has_low_information_content(output) and len(output) < 20:  # Only for very short outputs
-                    filtered_count += 1
-                    continue
+        # Enhanced quality filtering
+        output = item.get("output", "")
+        if output:
+            # Filter very short outputs
+            if len(output) < 5:
+                filtered_count += 1
+                continue
+            # Filter repetitive outputs
+            if is_repetitive(output):
+                filtered_count += 1
+                continue
+            # Filter low information content
+            if has_low_information_content(output):
+                filtered_count += 1
+                continue
         
         result.append(item)
     
     if filtered_count > 0:
-        print(f"Filtered out {filtered_count} low-quality items (aggressive_filtering={use_aggressive_filtering})")
+        print(f"Filtered out {filtered_count} low-quality items")
     return result
 
 

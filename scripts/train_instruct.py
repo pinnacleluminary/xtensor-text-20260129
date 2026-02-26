@@ -411,7 +411,7 @@ def main():
                 end_time=train_request["end_time"],
                 checking_mode=train_request.get("checking_mode", "none")
             ),
-            EarlyStoppingCallback(patience=300, min_delta=0.0001, model_name=train_request["model_name"])
+            EarlyStoppingCallback(patience=300, min_delta=0.0001)
         ],
     )
 

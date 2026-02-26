@@ -14,7 +14,6 @@ from transformers.trainer_utils import is_main_process
 import wandb
 import torch
 from state_manager import get_state, set_state
-import re
 MAX_TRIES = 9
 
 
@@ -75,32 +74,6 @@ class CustomEvalSaveCallback(TrainerCallback):
         # FRESH: Incremental evaluation - track subset evaluations
         self.subset_eval_results = {}  # step -> subset_eval_loss
         self.skip_full_eval_threshold = 1.1  # Skip full eval if subset loss > best * this
-        
-        # Adaptive settings: make features configurable via env vars
-        # Auto-detect small models and adjust settings automatically
-        is_small_model = self._is_small_model(original_model_name)
-        is_specialized_model = self._is_specialized_model(original_model_name)
-        
-        # Generalization penalty: adaptive based on model size (smaller models need less penalty)
-        # For small models (< 2B), use eval_loss directly or reduce penalty significantly
-        if is_small_model or is_specialized_model:
-            default_use_gen_score = "0"  # Disable for small/specialized models
-            default_penalty_factor = "0.15"  # Half penalty if enabled
-            default_interpolation = "0"  # Disable interpolation for small models
-            print(f"ADAPTIVE: Detected small/specialized model '{original_model_name}', using conservative settings", flush=True)
-        else:
-            default_use_gen_score = "1"
-            default_penalty_factor = "0.3"
-            default_interpolation = "1"
-        
-        self.use_generalization_score = os.getenv("USE_GENERALIZATION_SCORE", default_use_gen_score) == "1"
-        self.overfitting_penalty_factor = float(os.getenv("OVERFITTING_PENALTY_FACTOR", default_penalty_factor))
-        # Checkpoint interpolation: can be disabled for models that don't benefit
-        self.enable_checkpoint_interpolation = os.getenv("ENABLE_CHECKPOINT_INTERPOLATION", default_interpolation) == "1"
-        # Use eval_loss directly if generalization score is disabled
-        self.use_eval_loss_directly = not self.use_generalization_score
-        
-        print(f"ADAPTIVE Settings for '{original_model_name}': use_gen_score={self.use_generalization_score}, penalty_factor={self.overfitting_penalty_factor}, interpolation={self.enable_checkpoint_interpolation}", flush=True)
         
     def compute_loss(self, state: TrainerState, metrics):
         return metrics.get("eval_loss", None)
@@ -313,10 +286,8 @@ class CustomEvalSaveCallback(TrainerCallback):
                                 print(f"Eval loss {eval_loss:.6f} is best, but not last run. Will continue with next LR.", flush=True)
                         else:
                             # Adaptive early termination: if eval_loss is significantly worse, stop early
-                            # ADAPTIVE: Increased threshold from 20% to 30% to be less aggressive
-                            early_term_threshold = float(os.getenv("EARLY_TERM_THRESHOLD", "1.3"))  # 30% worse by default
-                            if eval_loss > current_min_eval_loss * early_term_threshold:
-                                print(f"ADAPTIVE TERMINATION: Eval loss {eval_loss:.6f} is >{((early_term_threshold-1)*100):.0f}% worse than best {current_min_eval_loss:.6f}, stopping early", flush=True)
+                            if eval_loss > current_min_eval_loss * 1.2:  # 20% worse
+                                print(f"ADAPTIVE TERMINATION: Eval loss {eval_loss:.6f} is >20% worse than best {current_min_eval_loss:.6f}, stopping early", flush=True)
                                 control.should_training_stop = True
                             else:
                                 print(f"Eval loss {eval_loss:.6f} is worse than best {current_min_eval_loss:.6f}, stopping this run", flush=True)
@@ -361,45 +332,30 @@ class CustomEvalSaveCallback(TrainerCallback):
             # DECISIVE: Compute generalization_score to penalize overfitting
             # generalization_score = eval_loss - penalty * overfitting_gap
             # Lower score is better (we want low eval_loss and low overfitting)
-            # ADAPTIVE: Make penalty adaptive - smaller models naturally have larger gaps
             generalization_score = eval_loss
             overfitting_penalty = 0.0
-            if self.use_generalization_score and train_loss is not None and train_loss > 0:
+            if train_loss is not None and train_loss > 0:
                 overfitting_gap = max(0, eval_loss - train_loss)
-                # Adaptive penalty: reduce penalty for smaller models or when gap is small
-                # Smaller penalty factor for models that naturally have larger train/eval gaps
-                penalty_factor = self.overfitting_penalty_factor
-                # If gap is very small (< 0.01), use even smaller penalty
-                if overfitting_gap < 0.01:
-                    penalty_factor = penalty_factor * 0.5
-                overfitting_penalty = penalty_factor * overfitting_gap
+                # Penalize overfitting: if eval_loss is much higher than train_loss, penalize it
+                # Use 0.3 as penalty factor (tuned for tournament)
+                overfitting_penalty = 0.3 * overfitting_gap
                 generalization_score = eval_loss - overfitting_penalty
-                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss={train_loss:.6f}, overfitting_gap={overfitting_gap:.6f}, penalty_factor={penalty_factor:.3f}, generalization_score={generalization_score:.6f}", flush=True)
+                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss={train_loss:.6f}, overfitting_gap={overfitting_gap:.6f}, generalization_score={generalization_score:.6f}", flush=True)
             else:
-                if not self.use_generalization_score:
-                    print(f"Step {state.global_step}: Using eval_loss directly (generalization_score disabled)", flush=True)
-                else:
-                    print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss=None, generalization_score={generalization_score:.6f}", flush=True)
+                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss=None, generalization_score={generalization_score:.6f}", flush=True)
             
-            # Update best checkpoint using generalization_score or eval_loss
+            # Update best checkpoint using generalization_score (not just eval_loss)
             should_update = False
             if self.best_checkpoint_info is None:
                 should_update = True
             else:
-                # Compare using generalization_score if enabled, otherwise use eval_loss directly
-                if self.use_generalization_score:
-                    current_best_score = self.best_checkpoint_info.get("generalization_score", self.best_checkpoint_info["loss"])
-                    comparison_score = generalization_score
-                else:
-                    current_best_score = self.best_checkpoint_info["loss"]
-                    comparison_score = eval_loss
-                if comparison_score < current_best_score:
+                # Compare using generalization_score for better generalization
+                current_best_score = self.best_checkpoint_info.get("generalization_score", self.best_checkpoint_info["loss"])
+                if generalization_score < current_best_score:
                     should_update = True
             
             if should_update:
-                score_type = "generalization_score" if self.use_generalization_score else "eval_loss"
-                score_value = generalization_score if self.use_generalization_score else eval_loss
-                print(f"DECISIVE: Updating best checkpoint at step {state.global_step} with {score_type}: {score_value:.6f} (eval_loss: {eval_loss:.6f})", flush=True)
+                print(f"DECISIVE: Updating best checkpoint at step {state.global_step} with generalization_score: {generalization_score:.6f} (eval_loss: {eval_loss:.6f})", flush=True)
                 self.best_checkpoint_info = {
                     "loss": eval_loss,
                     "step": state.global_step,
@@ -409,74 +365,29 @@ class CustomEvalSaveCallback(TrainerCallback):
                 }
                 self.update_best_checkpoint = True
             
-            # DECISIVE: Track top 2 checkpoints for interpolation (if enabled)
-            if self.enable_checkpoint_interpolation:
-                checkpoint_entry = {
-                    "step": state.global_step,
-                    "eval_loss": eval_loss,
-                    "train_loss": train_loss,
-                    "generalization_score": generalization_score if self.use_generalization_score else eval_loss
-                }
-                
-                # Add to top checkpoints list
-                self.top_checkpoints.append(checkpoint_entry)
-                
-                # Keep only top 2 by generalization_score or eval_loss
-                sort_key = "generalization_score" if self.use_generalization_score else "eval_loss"
-                self.top_checkpoints.sort(key=lambda x: x[sort_key])
-                if len(self.top_checkpoints) > self.max_top_checkpoints:
-                    self.top_checkpoints = self.top_checkpoints[:self.max_top_checkpoints]
-                
-                top_ckpt_info = [(c['step'], f"{sort_key}={c[sort_key]:.6f}") for c in self.top_checkpoints]
-                print(f"Top {len(self.top_checkpoints)} checkpoints: {top_ckpt_info}", flush=True)
+            # DECISIVE: Track top 2 checkpoints for interpolation
+            checkpoint_entry = {
+                "step": state.global_step,
+                "eval_loss": eval_loss,
+                "train_loss": train_loss,
+                "generalization_score": generalization_score
+            }
+            
+            # Add to top checkpoints list
+            self.top_checkpoints.append(checkpoint_entry)
+            
+            # Keep only top 2 by generalization_score
+            self.top_checkpoints.sort(key=lambda x: x["generalization_score"])
+            if len(self.top_checkpoints) > self.max_top_checkpoints:
+                self.top_checkpoints = self.top_checkpoints[:self.max_top_checkpoints]
+            
+            top_ckpt_info = [(c['step'], f"gen_score={c['generalization_score']:.6f}") for c in self.top_checkpoints]
+            print(f"Top {len(self.top_checkpoints)} checkpoints: {top_ckpt_info}", flush=True)
             
             if not should_update and self.best_checkpoint_info is not None:
-                if self.use_generalization_score:
-                    current_best_score = self.best_checkpoint_info.get("generalization_score", self.best_checkpoint_info["loss"])
-                    print(f" At step: {state.global_step} The generalization_score: {generalization_score:.6f} is not better than current best: {current_best_score:.6f}, update_best_checkpoint={self.update_best_checkpoint}", flush=True)
-                else:
-                    current_best_score = self.best_checkpoint_info["loss"]
-                    print(f" At step: {state.global_step} The eval_loss: {eval_loss:.6f} is not better than current best: {current_best_score:.6f}, update_best_checkpoint={self.update_best_checkpoint}", flush=True)
-    
-    def _is_small_model(self, model_name: str) -> bool:
-        """Detect if model is small (< 2B parameters)"""
-        if not model_name:
-            return False
-        
-        # Check for explicit size indicators in model name
-        # Patterns like "1.3B", "1.5B", "1.7B", "1.3b", etc.
-        size_match = re.search(r"(\d+\.?\d*)\s*[bB]", model_name)
-        if size_match:
-            size_value = float(size_match.group(1))
-            if size_value < 2.0:  # Less than 2B
-                return True
-        
-        # Check for known small models
-        small_model_patterns = [
-            r"tiny", r"small", r"smol", r"mini", r"neo-1\.3", r"neo-125m",
-            r"qwen2\.5-1\.5", r"1\.3b", r"1\.5b", r"1\.7b"
-        ]
-        model_lower = model_name.lower()
-        for pattern in small_model_patterns:
-            if re.search(pattern, model_lower):
-                return True
-        
-        return False
-    
-    def _is_specialized_model(self, model_name: str) -> bool:
-        """Detect if model is specialized (e.g., sqlcoder, code models)"""
-        if not model_name:
-            return False
-        
-        specialized_patterns = [
-            r"sqlcoder", r"code", r"sql", r"coder", r"defog"
-        ]
-        model_lower = model_name.lower()
-        for pattern in specialized_patterns:
-            if re.search(pattern, model_lower):
-                return True
-        
-        return False
+                current_best_score = self.best_checkpoint_info.get("generalization_score", self.best_checkpoint_info["loss"])
+                print(f" At step: {state.global_step} The generalization_score: {generalization_score:.6f} is not better than current best: {current_best_score:.6f}, update_best_checkpoint={self.update_best_checkpoint}", flush=True)
+            
 
     def on_save(self, args, state: TrainerState, control: TrainerControl, **kwargs):
         
@@ -494,7 +405,18 @@ class CustomEvalSaveCallback(TrainerCallback):
             current_step = state.global_step
             # Remove existing directory if it exists
             if os.path.exists(self.submission_dir):
-                shutil.rmtree(self.submission_dir)
+                try:
+                    shutil.rmtree(self.submission_dir, ignore_errors=True)
+                except Exception as e:
+                    try:
+                        import stat
+                        def handle_remove_readonly(func, path, exc):
+                            if os.path.exists(path):
+                                os.chmod(path, stat.S_IWRITE)
+                                func(path)
+                        shutil.rmtree(self.submission_dir, onerror=handle_remove_readonly)
+                    except Exception:
+                        pass
                 
             shutil.copytree(
                 os.path.join(self.output_dir, f"checkpoint-{current_step}"),
@@ -518,20 +440,28 @@ class CustomEvalSaveCallback(TrainerCallback):
             print(f"Copy the best checkpoint to the submission directory at step: {state.global_step}", flush=True)
             # Remove existing directory if it exists
             if os.path.exists(self.submission_dir):
-                shutil.rmtree(self.submission_dir)
+                try:
+                    shutil.rmtree(self.submission_dir, ignore_errors=True)
+                except Exception as e:
+                    try:
+                        import stat
+                        def handle_remove_readonly(func, path, exc):
+                            if os.path.exists(path):
+                                os.chmod(path, stat.S_IWRITE)
+                                func(path)
+                        shutil.rmtree(self.submission_dir, onerror=handle_remove_readonly)
+                    except Exception:
+                        pass
             
             best_eval_loss = self.best_checkpoint_info["loss"]
             best_gen_score = self.best_checkpoint_info.get("generalization_score", best_eval_loss)
             
             # DECISIVE: Checkpoint interpolation - use top 2 checkpoints if available
-            # Only interpolate if enabled and we have 2 good checkpoints
-            use_interpolation = False
-            if self.enable_checkpoint_interpolation and len(self.top_checkpoints) >= 2:
-                sort_key = "generalization_score" if self.use_generalization_score else "eval_loss"
-                score1 = self.top_checkpoints[0][sort_key]
-                score2 = self.top_checkpoints[1][sort_key]
-                # Within 5% of each other
-                use_interpolation = score1 < score2 * 1.05
+            # Only interpolate if we have 2 good checkpoints and time permits
+            use_interpolation = (
+                len(self.top_checkpoints) >= 2 
+                and self.top_checkpoints[0]["generalization_score"] < self.top_checkpoints[1]["generalization_score"] * 1.05  # Within 5% of each other
+            )
             
             if use_interpolation:
                 print(f"DECISIVE: Interpolating top 2 checkpoints for better generalization", flush=True)
@@ -622,7 +552,19 @@ class CustomEvalSaveCallback(TrainerCallback):
                     # Fallback: just use best checkpoint if interpolation fails
                     print(f"  Warning: Interpolation failed ({e}), using best checkpoint only", flush=True)
                     if os.path.exists(self.submission_dir):
-                        shutil.rmtree(self.submission_dir)
+                        try:
+                            shutil.rmtree(self.submission_dir, ignore_errors=True)
+                        except Exception as err:
+                            print(f"Warning: Error removing submission directory (ignoring): {err}", flush=True)
+                            try:
+                                import stat
+                                def handle_remove_readonly(func, path, exc):
+                                    if os.path.exists(path):
+                                        os.chmod(path, stat.S_IWRITE)
+                                        func(path)
+                                shutil.rmtree(self.submission_dir, onerror=handle_remove_readonly)
+                            except Exception:
+                                pass
                     shutil.copytree(
                         os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
                         self.submission_dir
@@ -786,69 +728,15 @@ class EarlyStoppingCallback(TrainerCallback):
     Early stopping callback to prevent overfitting.
     Stops training when eval_loss doesn't improve for 'patience' evaluations.
     Works with both standard eval_loss and GRPO's eval_reward (negated).
-    ADAPTIVE: Can be disabled or made less aggressive via env vars.
     """
-    def __init__(self, patience: int = 300, min_delta: float = 0.0001, model_name: str = None):
-        # ADAPTIVE: Make early stopping configurable - can be disabled or less aggressive
-        # Auto-detect small models and use less aggressive settings
-        is_small = self._is_small_model(model_name) if model_name else False
-        is_specialized = self._is_specialized_model(model_name) if model_name else False
-        
-        if is_small or is_specialized:
-            default_enabled = "0"  # Disable for small/specialized models
-            default_patience = "500"  # Higher patience if enabled
-            print(f"ADAPTIVE: Detected small/specialized model '{model_name}', using conservative early stopping", flush=True)
-        else:
-            default_enabled = "1"
-            default_patience = str(patience)
-        
-        self.enabled = os.getenv("ENABLE_EARLY_STOPPING", default_enabled) == "1"
-        # Increase patience for smaller models that need more training
-        self.patience = int(os.getenv("EARLY_STOPPING_PATIENCE", default_patience))
-        self.min_delta = float(os.getenv("EARLY_STOPPING_MIN_DELTA", str(min_delta)))
+    def __init__(self, patience: int = 300, min_delta: float = 0.0001):
+        self.patience = patience
+        self.min_delta = min_delta
         self.best_loss = None
         self.wait = 0
         self.stopped_epoch = 0
-        if not self.enabled:
-            print(f"Early stopping is DISABLED (ENABLE_EARLY_STOPPING=0)", flush=True)
-        else:
-            print(f"Early stopping enabled: patience={self.patience}, min_delta={self.min_delta}", flush=True)
-    
-    def _is_small_model(self, model_name: str) -> bool:
-        """Detect if model is small (< 2B parameters)"""
-        if not model_name:
-            return False
-        size_match = re.search(r"(\d+\.?\d*)\s*[bB]", model_name)
-        if size_match:
-            size_value = float(size_match.group(1))
-            if size_value < 2.0:
-                return True
-        small_model_patterns = [
-            r"tiny", r"small", r"smol", r"mini", r"neo-1\.3", r"neo-125m",
-            r"qwen2\.5-1\.5", r"1\.3b", r"1\.5b", r"1\.7b"
-        ]
-        model_lower = model_name.lower()
-        for pattern in small_model_patterns:
-            if re.search(pattern, model_lower):
-                return True
-        return False
-    
-    def _is_specialized_model(self, model_name: str) -> bool:
-        """Detect if model is specialized (e.g., sqlcoder, code models)"""
-        if not model_name:
-            return False
-        specialized_patterns = [r"sqlcoder", r"code", r"sql", r"coder", r"defog"]
-        model_lower = model_name.lower()
-        for pattern in specialized_patterns:
-            if re.search(pattern, model_lower):
-                return True
-        return False
     
     def on_evaluate(self, args, state, control, metrics, **kwargs):
-        # ADAPTIVE: Skip early stopping if disabled
-        if not self.enabled:
-            return control
-            
         # Try to get eval_loss first, then eval_reward (for GRPO)
         eval_loss = metrics.get("eval_loss", None)
         if eval_loss is None and state.log_history:
