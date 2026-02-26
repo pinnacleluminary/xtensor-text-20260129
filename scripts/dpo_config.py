@@ -157,15 +157,14 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --save_strategy no \
     --logging_steps 5 \
     --learning_rate {learning_rate} \
-    --weight_decay 0.01 \
+    --weight_decay 0. \
     --warmup_steps 35 \
     --lr_scheduler_type cosine_with_min_lr \
     --lr_scheduler_kwargs "{\\"min_lr_rate\\": {min_lr_rate}}" \
     --tf32 True \
     --gradient_checkpointing {gradient_checkpointing} \
     --optim {optimizer} \
-    --use_liger {use_liger} --disable_fa {disable_fa} \
-    --label_smoothing_factor {label_smoothing_factor}"""
+    --use_liger {use_liger} --disable_fa {disable_fa}"""
     )
 
     if config.get("use_lora", False):
@@ -207,8 +206,6 @@ def get_training_json(train_info: dict) -> dict:
         "distributed": config.get("distributed", "ddp"),
         "gradient_checkpointing": get_gradient_checkpointing(model_name),
         "gradient_accumulation_steps": 1,
-        # Keep default at 0 for stability/speed; label smoothing can increase memory usage.
-        "label_smoothing_factor": 0.0,
         "use_attn_implementation": "kernels-community/vllm-flash-attn3" if train_info.get("is_openai", False) else ""
     }
     
@@ -228,9 +225,7 @@ def get_training_json(train_info: dict) -> dict:
         else:
             print(f"Using lr from config: {run_config['learning_rate']}", flush=True)
     
-    base_lr = run_config["learning_rate"]
     run_config["learning_rate"] *= train_info["reg_ratio"]
-    print(f"Applied reg_ratio: {base_lr:.8f} * {train_info['reg_ratio']:.6f} = {run_config['learning_rate']:.8f}", flush=True)
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
     if run_config["disable_fa"] == "False":
         run_cmd = run_cmd + " --padding_free True"
@@ -240,11 +235,6 @@ def get_training_json(train_info: dict) -> dict:
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
     train_request["checking_step"] = 80
-
-    # Short-job mode: reduce save overhead.
-    hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
-    if hours_to_complete > 0 and hours_to_complete <= 0.75:
-        train_request["periodic_save_steps"] = -1
     
     return {
         "train_request": train_request,

@@ -98,6 +98,10 @@ class RewardFunction(BaseModel):
 class GrpoDatasetType(BaseModel):
     field_prompt: str | None = None
     reward_functions: list[RewardFunction] | None = []
+    
+    
+class EnvironmentDatasetType(InstructTextDatasetType):
+    environment_name: str | None = None
 
 
 class DpoDatasetType(BaseModel):
@@ -132,7 +136,7 @@ class Job(BaseModel):
     expected_repo_name: str | None = None
 
 
-TextDatasetType = InstructTextDatasetType | DpoDatasetType | GrpoDatasetType | ChatTemplateDatasetType
+TextDatasetType = InstructTextDatasetType | DpoDatasetType | GrpoDatasetType | ChatTemplateDatasetType | EnvironmentDatasetType
 
 
 class TextJob(Job):
@@ -177,6 +181,7 @@ class TaskType(str, Enum):
     DPOTASK = "DpoTask"
     GRPOTASK = "GrpoTask"
     CHATTASK = "ChatTask"
+    ENVIRONMENTTASK = "EnvTask"
 
     def __hash__(self):
         return hash(str(self))

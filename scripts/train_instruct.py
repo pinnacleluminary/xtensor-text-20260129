@@ -10,7 +10,7 @@ import torch
 from transformers.trainer_utils import is_main_process
 from dataclasses import dataclass, field
 from transformers import Trainer
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
 
 # from packing.packed_dataset import PackedDataset
 from transformers import (
@@ -119,12 +119,6 @@ def load_lora_model(training_args: TrainingArguments, model_path: str, lora_args
             else None
         ),
     )
-    # FlashAttention2 needs the model initialized on GPU to avoid falling back / warnings.
-    if not training_args.disable_fa and torch.cuda.is_available():
-        try:
-            model = model.to(f"cuda:{LOCAL_RANK}")
-        except Exception as e:
-            log_info(f"Warning: failed to move LoRA base model to GPU early: {e}")
     # do not resize tokem embeddings in LOra --> will encounter size mismatch error in evaluation 
     # model.resize_token_embeddings(token_nums)
     # convert to lora
@@ -184,12 +178,6 @@ def load_model(training_args: TrainingArguments, model_path: str, token_nums: in
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_implementation,
     )
-    # FlashAttention2 needs the model initialized on GPU to avoid falling back / warnings.
-    if (not training_args.disable_fa) and ("flash_attention" in str(attn_implementation)) and torch.cuda.is_available():
-        try:
-            model = model.to(f"cuda:{LOCAL_RANK}")
-        except Exception as e:
-            log_info(f"Warning: failed to move model to GPU early for FA2: {e}")
     # model.resize_token_embeddings(token_nums)
     return model
 
@@ -213,8 +201,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # Ensure consistent padding side for causal LMs (matches validator)
-    tokenizer.padding_side = "left"  # Left padding for causal LMs
     
     # wandb_init_success = init_wandb(train_request)
     # if not wandb_init_success:
@@ -227,22 +213,6 @@ def main():
     max_length = get_max_length_config()
     if "max_length" in train_request:
         max_length = train_request["max_length"]
-
-    # Reduce OOM retries by applying a conservative batch-size cap for long sequence lengths.
-    # This is much faster than crashing multiple times and halving repeatedly.
-    if train_request.get("adjust_batch_size", True):
-        cap = None
-        if max_length >= 2048:
-            cap = 8 if not training_args.use_lora else 16
-        elif max_length >= 1536:
-            cap = 12 if not training_args.use_lora else 24
-        elif max_length >= 1024:
-            cap = 24 if not training_args.use_lora else 48
-        if cap is not None and training_args.per_device_train_batch_size > cap:
-            log_info(
-                f"Capping per_device_train_batch_size from {training_args.per_device_train_batch_size} to {cap} (max_length={max_length}) to avoid OOM"
-            )
-            training_args.per_device_train_batch_size = cap
 
     # we already tokenize the data and save it to train_tokenized.json and dev_tokenized.json
     train_ds = MyDataset(
@@ -395,7 +365,7 @@ def main():
     
     trainer = Trainer(
         model=model,
-        processing_class=tokenizer,  # Changed from tokenizer to processing_class (deprecated parameter)
+        tokenizer=tokenizer,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=dev_ds,
@@ -410,17 +380,14 @@ def main():
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
                 checking_mode=train_request.get("checking_mode", "none")
-            ),
-            EarlyStoppingCallback(patience=300, min_delta=0.0001)
+            )
         ],
     )
 
     trainer.tokenizer = tokenizer
-    # Automatically resume from last checkpoint if one exists
-    last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if last_checkpoint:
-        log_info(f"Resuming from checkpoint: {last_checkpoint}")
-    trainer.train(resume_from_checkpoint=last_checkpoint if last_checkpoint else None)
+    # last_checkpoint = get_last_checkpoint(training_args.output_dir)
+    # log_info(f"last_checkpoint: {last_checkpoint}")
+    trainer.train()
     
     if is_main_process(LOCAL_RANK):
         success_file = os.path.join(training_args.output_dir, "success.txt")

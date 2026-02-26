@@ -1,4 +1,5 @@
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+COPY --from=ghcr.io/astral-sh/uv:0.9.14 /uv /uvx /bin/
 
 # System dependencies
 RUN apt-get update && apt-get install -y \
@@ -20,31 +21,30 @@ RUN mkdir -p /cache
 RUN mkdir -p /workspace/scripts/datasets
 RUN mkdir -p /app/checkpoints
 WORKDIR /workspace/scripts
-# Copy current folder to /workspace/auto_ml
-COPY scripts /workspace/scripts
-# Make entrypoint script executable
-RUN chmod +x /workspace/scripts/entrypoint.sh
-# Pytorch (Auto-selects backend https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection)
 
-# Create a virtual environment for data generation
-RUN python -m venv /workspace/axo_py
-RUN bash -c "source /workspace/axo_py/bin/activate && \
+# # Setup AlfWorld server env
+# COPY scripts/alfworld_setup.sh /workspace/scripts/alfworld_setup.sh
+# COPY scripts/alfworld_run.sh /workspace/scripts/alfworld_run.sh
+# RUN chmod +x /workspace/scripts/alfworld_setup.sh
+# RUN /workspace/scripts/alfworld_setup.sh
+
+# Install main dependencies
+COPY scripts/grpo_requirements.txt /workspace/scripts/grpo_requirements.txt
+RUN python -m venv /workspace/.grpo_env
+RUN bash -c "source /workspace/.grpo_env/bin/activate && \
     pip install uv && \
-    pip install -U packaging==23.2 setuptools==75.8.0 wheel ninja && \
-    uv pip install --no-build-isolation axolotl==0.9.1 && \
-    pip install requests==2.32.3 && \
+    uv pip install --no-build-isolation -r /workspace/scripts/grpo_requirements.txt && \
+    uv pip install --no-build-isolation flash-attn==2.8.3 && \
+    git clone --depth 1 https://github.com/WooooDyy/AgentGym && \
+    uv pip install --no-build-isolation AgentGym/agentenv && \
     deactivate"
 
+# Copy current folder to /workspace/auto_ml
+COPY scripts /workspace/scripts
+# # Make entrypoint script executable
+# RUN chmod +x /workspace/scripts/alfworld_run.sh
 
-# install the main dependencies
-RUN pip install uv && \
-    pip install -U packaging==23.2 setuptools==75.8.0 wheel ninja && \
-    uv pip install -r /workspace/scripts/training_requirements.txt --system && \
-    pip install hf_transfer==0.1.9 && \
-    pip install tenacity==9.1.2 && \
-    pip install tiktoken==0.9.0 && \
-    pip install flash-attn==v2.7.4.post1 --no-build-isolation && \
-    uv pip install vllm==0.8.3 --system && \
-    pip install "fiber @ git+https://github.com/rayonlabs/fiber.git@2.4.0"
+RUN chmod +x /workspace/scripts/run_text_trainer.sh
+# RUN chmod +x /workspace/scripts/entrypoint.sh
 
-ENTRYPOINT ["./entrypoint.sh"]
+ENTRYPOINT ["./run_text_trainer.sh"]

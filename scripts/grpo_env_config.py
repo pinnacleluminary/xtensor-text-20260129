@@ -3,60 +3,87 @@ from model_utility import (
     get_model_num_params,
     get_use_liger,
     disable_flash_attention,
+    disable_action_mask,
     get_use_vllm,
     get_gradient_checkpointing,
     get_gpu_count,
 )
 from copy import deepcopy
-from lrs_lookup import get_grpo_lr, get_grpo_python_lr
+from lrs_lookup import get_grpo_lr
 allow_find_lk_lr = False
 
 GRPO_CONFIG = {
     "0_1_b": {
-        "lr": 8e-6,
+        "lr": 3e-5,
         "distributed": "ddp",
         "gpu_count": 1,
-        "batch_size": 40,
+        "batch_size": 4,
+        "gradient_accumulation_steps": 6,
         "vllm_gpu_memory_utilization": 0.4,
+        "use_lora": True,
+        "beta": 0.02,
+        "num_generations": 4,
+        "initial_max_turn": 1,
+        "rollouts_per_stage": 1280,  # Reduced for more frequent curriculum progression
     },
     "1_2_b": {
         "lr": 8e-6,
         "distributed": "ddp",
         "gpu_count": 1,
-        "batch_size": 40,
+        "batch_size": 3,
+        "gradient_accumulation_steps": 12,
         "vllm_gpu_memory_utilization": 0.4,
+        "beta": 0.04,
+        "num_generations": 4,
+        "rollouts_per_stage": 1280,
     },
     "2_4_b": {
         "lr": 8e-6,
         "distributed": "ddp",
         "gpu_count": 2,
-        "batch_size": 42,
-        "vllm_gpu_memory_utilization": 0.35,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 8,
+        "vllm_gpu_memory_utilization": 0.3,
         "use_lora": True,
+        "beta": 0.01,
+        "num_generations": 4,
+        "rollouts_per_stage": 1280,
     },
     "4_5_b": {
         "lr": 6e-6,
         "distributed": "ddp",
         "gpu_count": 2,
-        "batch_size": 42,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 8,
         "use_lora": True,
-        "vllm_gpu_memory_utilization": 0.4,
+        "vllm_gpu_memory_utilization": 0.35,  # Reduced for Gin Rummy
+        "beta": 0.01,
+        "num_generations": 4,
+        "rollouts_per_stage": 1280,
     },
     "5_6_b": {
         "lr": 6e-6,
         "distributed": "ddp",
         "gpu_count": 2,
-        "batch_size": 42,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 8,
         "use_lora": True,
-        "vllm_gpu_memory_utilization": 0.4,
+        "vllm_gpu_memory_utilization": 0.35,  # Reduced for Gin Rummy
+        "beta": 0.01,
+        "num_generations": 4,
+        "rollouts_per_stage": 1280,
     },
     "6_9_b": {
         "lr": 6e-6,
         "distributed": "ddp",
         "gpu_count": 4,
-        "batch_size": 24,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 4,
         "use_lora": True,
-        "vllm_gpu_memory_utilization": 0.5,
+        "vllm_gpu_memory_utilization": 0.35,  # Reduced for Gin Rummy (longer episodes = more KV cache)
+        "beta": 0.01,
+        "num_generations": 4,
+        "rollouts_per_stage": 1024,  # Increased from 768 for better curriculum
     },
     "9_12_b": {
         "lr": 6e-6,
@@ -65,6 +92,7 @@ GRPO_CONFIG = {
         "use_lora": True,
         "batch_size": 16,
         "vllm_gpu_memory_utilization": 0.6,
+        "beta": 0.01,
     },
     "12_15_b": {
         "lr": 5e-6,
@@ -73,6 +101,7 @@ GRPO_CONFIG = {
         "use_lora": True,
         "batch_size": 2,
         "vllm_gpu_memory_utilization": 0.8,
+        "beta": 0.01,
     },
     "15_20_b": {
         "lr": 5e-6,
@@ -82,6 +111,7 @@ GRPO_CONFIG = {
         "batch_size": 16,
         "vllm_gpu_memory_utilization": 0.6,
         "use_vllm": False,
+        "beta": 0.01,
     },
     "20_40_b": {
         "lr": 4e-6,
@@ -92,6 +122,7 @@ GRPO_CONFIG = {
         "vllm_gpu_memory_utilization": 0.6,
         "use_vllm": False,
         "use_4bit": True,
+        "beta": 0.01,
     },
     "40_80_b": {
         "lr": 3e-6,
@@ -102,28 +133,12 @@ GRPO_CONFIG = {
         "vllm_gpu_memory_utilization": 0.7,
         "use_vllm": False,
         "use_4bit": True,
+        "beta": 0.01,
     },
 }
 
 for key in GRPO_CONFIG:
     GRPO_CONFIG[key]["label"] = key
-
-
-def if_contain_slow_reward_function(dataset_type: dict) -> bool:
-    reward_functions = dataset_type["reward_functions"]
-    for reward_func in reward_functions:
-        func_def = reward_func["reward_func"]
-        keywords = [
-            "import langcheck",
-            "from langcheck",
-            "import detoxify",
-            "from detoxify",
-            "import textstat",
-            "from textstat",
-        ]
-        if any(keyword in func_def for keyword in keywords):
-            return True
-    return False
 
 
 def get_grpo_config(param_nums: int) -> dict:
@@ -160,16 +175,6 @@ def get_grpo_config(param_nums: int) -> dict:
         }
 
 
-def contain_python_execution(dataset_type: dict) -> bool:
-    reward_functions = dataset_type["reward_functions"]
-    for reward_func in reward_functions:
-        func_def = reward_func["reward_func"]
-        keywords = ["sat_reward_function", "ded_reward_function", "abd_reward_function"]
-        if any(keyword in func_def for keyword in keywords):
-            return True
-    return False
-
-
 def get_run_cmd(config: dict, gpu_nums: int):
     required_keys = [
         "epoch_num",
@@ -181,6 +186,9 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "vllm_gpu_memory_utilization",
         "num_generations",
         "disable_fa",
+        "disable_action_mask",
+        "beta",
+        "environment_name",
     ]
     for key in required_keys:
         if key not in config:
@@ -196,8 +204,9 @@ def get_run_cmd(config: dict, gpu_nums: int):
 
     template = (
         start_cmd
-        + """ train_grpo.py \
+        + """ train_grpo_env.py \
     --request_path {request_path} \
+    --environment_name {environment_name} \
     --bf16 True \
     --report_to wandb \
     --output_dir /workspace/data/trained_model \
@@ -208,7 +217,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --eval_accumulation_steps 1 \
     --eval_strategy no \
     --save_strategy no \
-    --logging_steps 5 \
+    --logging_steps 1 \
     --learning_rate {learning_rate} \
     --weight_decay 0. \
     --warmup_steps 35 \
@@ -218,12 +227,19 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --gradient_checkpointing {gradient_checkpointing} \
     --optim {optimizer} \
     --use_liger {use_liger} --num_generations {num_generations} --vllm_mode colocate --vllm_gpu_memory_utilization {vllm_gpu_memory_utilization} \
-    --disable_fa {disable_fa}"""
+    --disable_fa {disable_fa} \
+    --disable_action_mask {disable_action_mask} \
+    --beta {beta} \
+    --num_generations {num_generations} \
+    --loss_type dr_grpo \
+    --num_iterations 2 \
+    --do_eval False \
+    --vllm_max_model_length 5248"""
     )
 
     if config.get("use_lora", False):
         template += (
-            " --use_peft --lora_r 128 --lora_alpha 256 --lora_target_modules all-linear"
+            " --use_peft --lora_r 32 --lora_alpha 64 --lora_target_modules all-linear"
         )
 
     if config.get("use_vllm", True):
@@ -245,6 +261,13 @@ def get_run_cmd(config: dict, gpu_nums: int):
             template
             + " --load_in_4bit True --use_bnb_nested_quant True --bnb_4bit_quant_type nf4"
         )
+
+    if config.get("initial_max_turn", 2) != 2:
+        template = template + f" --initial_max_turn {config.get('initial_max_turn', 2)}"
+    if config.get("rollouts_per_stage", 1280) != 1280:
+        template = template + f" --rollouts_per_stage {config.get('rollouts_per_stage', 1280)}"
+        
+    print(f"template: {template}", flush=True)
     return template
 
 
@@ -254,27 +277,34 @@ def get_training_json(train_info: dict) -> dict:
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
     config = get_grpo_config(param_nums)
+    if model_name in ["mistralai/Mistral-7B-Instruct-v0.3", "mistralai/Mistral-7B-Instruct-v0.2"]:
+        config = GRPO_CONFIG["6_9_b"]
     print(f"config: {config}")
     run_config = {
         "epoch_num": 2,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
         "min_lr_rate": 0.25,
-        "use_liger": get_use_liger(model_architecture),
+        "use_liger": False,
         "optimizer": "paged_adamw_8bit",
         "use_lora": config.get("use_lora", False),
         "disable_fa": disable_flash_attention(model_architecture, model_name),
+        "disable_action_mask": disable_action_mask(model_name),
         "gpu_nums": config["gpu_count"],
         "output_dir": train_info["output_dir"],
         "request_path": train_info["request_path"],
         "distributed": config.get("distributed", "ddp"),
         "gradient_checkpointing": get_gradient_checkpointing(model_name),
-        "gradient_accumulation_steps": 4,
+        "gradient_accumulation_steps": config.get("gradient_accumulation_steps", 8),
         "vllm_gpu_memory_utilization": config.get("vllm_gpu_memory_utilization", 0.4),
-        "num_generations": 2,
         "use_vllm": get_use_vllm(model_architecture, model_name),
         "tensor_parallel": config.get("tensor_parallel", False),
         "use_4bit": config.get("use_4bit", False),
+        "beta": config.get("beta", 0.01),
+        "num_generations": config.get("num_generations", 4),
+        "initial_max_turn": config.get("initial_max_turn", 2),
+        "rollouts_per_stage": config.get("rollouts_per_stage", 1280),
+        "environment_name": train_info.get("dataset_type", {}).get("environment_name"),
     }
 
     if model_name == "OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5":
@@ -284,68 +314,19 @@ def get_training_json(train_info: dict) -> dict:
         run_config["batch_size"] = int(run_config["batch_size"] / 1.5)
 
     train_request = deepcopy(train_info)
-    train_request["save_before_remaining_time"] = 3
+    train_request["save_before_remaining_time"] = 10
     train_request["min_steps"] = 100
     train_request["adjust_batch_size"] = False
-    train_request["periodic_save_steps"] = 100
-
-    if if_contain_slow_reward_function(train_info["dataset_type"]):
-        train_request["save_before_remaining_time"] = 12
-        if config["label"] == "0_1_b":
-            run_config["batch_size"] = 8
-        elif config["label"] == "1_2_b":
-            run_config["batch_size"] = 10
-        elif config["label"] == "2_4_b":
-            run_config["batch_size"] = 16
-        elif config["label"] == "4_5_b":
-            run_config["batch_size"] = 16
-        elif config["label"] == "5_6_b":
-            run_config["batch_size"] = 16
-        elif config["label"] == "6_9_b":
-            run_config["batch_size"] = 16
-            if (
-                model_name == "unsloth/gemma-2-9b-it"
-            ):  # encounter OOM error with batch_size 12
-                run_config["batch_size"] = 8
-        elif config["label"] == "9_12_b":
-            run_config["batch_size"] = 16
-        elif config["label"] == "12_15_b":
-            run_config["batch_size"] = 2
-        elif config["label"] == "15_20_b":
-            run_config["batch_size"] = 2
-        elif config["label"] == "20_40_b":
-            run_config["batch_size"] = 16  # this is high because we use 4bit
-        elif config["label"] == "40_80_b":
-            run_config["batch_size"] = 2
-
-        elif config["label"] == "13_15_b":
-            run_config["batch_size"] = 12
+    train_request["periodic_save_steps"] = 75
 
     total_batch_size = run_config["batch_size"] * run_config["gpu_nums"]
-    if total_batch_size < 64:
-        run_config["gradient_accumulation_steps"] = min(4, int(64 / total_batch_size))
 
     run_config["eval_batch_size"] = 4
     if run_config["batch_size"] <= 4:
-        run_config["eval_batch_size"] = 2
+        run_config["eval_batch_size"] = 1
 
     if not config.get("use_vllm", True):
         run_config["use_vllm"] = False
-
-    if train_info["find_lk_lr"] and allow_find_lk_lr:
-        # get lr from lrs_lookup.py
-        has_python_execution = contain_python_execution(train_info["dataset_type"])
-        if not has_python_execution:
-            lr = get_grpo_lr(model_name)
-            print(f"Using lr from lk not python: {lr}", flush=True)
-        else:
-            lr = get_grpo_python_lr(model_name)
-            print(f"Using lr from lk python: {lr}", flush=True)
-        if lr is not None:
-            print(f"Using lr from lk: {lr}", flush=True)
-            run_config["learning_rate"] = lr
-        else:
-            print(f"Using lr from config: {run_config['learning_rate']}", flush=True)
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
 
