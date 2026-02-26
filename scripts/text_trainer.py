@@ -257,8 +257,75 @@ def patch_wandb_symlinks(base_dir: str):
                     pathlib.Path(full_path).touch()
 
 
+def _select_best_checkpoint(train_runs: list[dict]) -> tuple[int, float, str]:
+    """
+    Select the best checkpoint from training runs with improved tie-breaking logic.
+    
+    Selection strategy:
+    1. Primary: Use eval_loss if available (better generalization indicator)
+    2. Tie-breaking: If losses are equal (within 0.1%), prefer:
+       - Lower train_loss (less overfitting)
+       - Earlier run index (more training time remaining)
+    
+    Args:
+        train_runs: List of training run dictionaries
+        
+    Returns:
+        Tuple of (index, selected_loss, loss_type) where loss_type is 'eval_loss' or 'train_loss'
+    """
+    if not train_runs:
+        raise ValueError("Cannot select best checkpoint from empty list")
+    
+    if all("current_eval_loss" in run for run in train_runs):
+        # Use eval_loss for selection (much better than train_loss)
+        losses_for_selection = [run.get("current_eval_loss", run["current_loss"]) for run in train_runs]
+        min_loss = min(losses_for_selection)
+        
+        # Find all runs with minimum loss (within 0.1% tolerance for floating point)
+        epsilon = min_loss * 0.001
+        candidates = [
+            (i, run) for i, (loss, run) in enumerate(zip(losses_for_selection, train_runs))
+            if abs(loss - min_loss) <= epsilon
+        ]
+        
+        if len(candidates) == 1:
+            index = candidates[0][0]
+        else:
+            # Tie-breaking: prefer run with lower train_loss, then earlier index
+            candidates.sort(key=lambda x: (x[1]["current_loss"], x[0]))
+            index = candidates[0][0]
+            print(f"Tie-breaking: {len(candidates)} runs with similar eval_loss, selected index {index} (train_loss={candidates[0][1]['current_loss']:.6f})", flush=True)
+        
+        selected_loss = train_runs[index]["current_eval_loss"]
+        return index, selected_loss, "eval_loss"
+    else:
+        # Fallback to current_loss if eval_loss not available (backward compatibility)
+        losses_for_selection = [run["current_loss"] for run in train_runs]
+        min_loss = min(losses_for_selection)
+        
+        # Find all runs with minimum loss (within 0.1% tolerance)
+        epsilon = min_loss * 0.001
+        candidates = [
+            i for i, loss in enumerate(losses_for_selection)
+            if abs(loss - min_loss) <= epsilon
+        ]
+        
+        # If tie, prefer earlier run (more training time remaining)
+        index = min(candidates) if candidates else np.argmin(losses_for_selection)
+        
+        selected_loss = train_runs[index]["current_loss"]
+        return index, selected_loss, "train_loss"
+
+
 def delete_poor_checkpoints(train_runs: list[dict]):
-    # Use eval_loss for deletion if available, otherwise use current_loss
+    """
+    Delete checkpoints that are not the best.
+    Uses eval_loss for comparison if available, otherwise uses current_loss.
+    """
+    if not train_runs:
+        return
+    
+    # Get losses for comparison
     if all("current_eval_loss" in run for run in train_runs):
         # Use eval_loss for better checkpoint management
         losses_for_comparison = [run.get("current_eval_loss", run["current_loss"]) for run in train_runs]
@@ -428,11 +495,17 @@ def main():
         default=-1,
     )
     parser.add_argument(
-        "--max-steps", type=int, help="Max steps to use for training", default=-1
+        "--max-steps", 
+        type=int, 
+        help="Max steps to use for training", 
+        default=-1
     )
     parser.add_argument("--retries", type=int, help="Number of retries", default=5)
     parser.add_argument(
-        "--min-steps", type=int, help="Min steps to use for training", default=100
+        "--min-steps", 
+        type=int, 
+        help="Min steps to use for training", 
+        default=100
     )
 
     parser.add_argument(
@@ -628,10 +701,24 @@ def main():
     # at first the state is always running the train_cmd
 
     set_state(state)
-    # TODO Run something magic here
     count = 0
-    while True:
+    max_iterations = 20
+    while count < max_iterations:
         state = get_state()
+        
+        # Validate state structure
+        if not isinstance(state, dict):
+            print(f"ERROR: Invalid state type: {type(state)}, resetting to initial", flush=True)
+            state = {"mode": "initial"}
+            set_state(state)
+        
+        # Validate mode
+        valid_modes = ["initial", "continue", "finish"]
+        if state.get("mode") not in valid_modes:
+            print(f"ERROR: Invalid mode '{state.get('mode')}', resetting to initial", flush=True)
+            state["mode"] = "initial"
+            set_state(state)
+        
         train_cmd = original_train_cmd  # will replace based on the state later
         c_train_info = copy.deepcopy(train_info)
         final_output_dir = None
@@ -652,7 +739,12 @@ def main():
                         set_state(state)
                         break
                     current_lr = float(state["train"]["lr"])
-                    state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
+                    
+                    if "runs" in state and len(state.get("runs", [])) > 0:
+                        state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
+                    else:
+                        state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
+                    
                     assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
                     state["runs"] = []
                 
@@ -666,20 +758,7 @@ def main():
                     if new_cmd is not None:
                         train_cmd = new_cmd
                 else: # the final run - continue training the best checkpoint to completion
-                    # CRITICAL: Use eval_loss for selection if available, otherwise fall back to current_loss
-                    # This is the key improvement - eval_loss is what matters for generalization
-                    if all("current_eval_loss" in run for run in state["runs"]):
-                        # Use eval_loss for selection (much better than train_loss)
-                        losses_for_selection = [run.get("current_eval_loss", run["current_loss"]) for run in state["runs"]]
-                        index = np.argmin(losses_for_selection)
-                        selected_loss = state["runs"][index]["current_eval_loss"]
-                        print(f"BL (using eval_loss);{index};eval_loss={selected_loss:.6f};train_loss={state['runs'][index]['current_loss']:.6f};lr={state['lrs'][index]}", flush=True)
-                    else:
-                        # Fallback to current_loss if eval_loss not available (backward compatibility)
-                        losses_for_selection = [run["current_loss"] for run in state["runs"]]
-                        index = np.argmin(losses_for_selection)
-                        selected_loss = state["runs"][index]["current_loss"]
-                        print(f"BL (using train_loss fallback);{index};{selected_loss:.6f}; {state['lrs'][index]}", flush=True)
+                    index, selected_loss, loss_type = _select_best_checkpoint(state["runs"])
                     
                     c_train_info["train_request"]["checking_mode"] = "none"
                     # Use the best checkpoint's train_cmd and output_dir
@@ -688,7 +767,8 @@ def main():
                     final_output_dir = state["runs"][index]["output_dir"]
                     state["mode"] = "finish"
             else: # the state = finish; no need to run more
-                assert state["mode"] == "finish"
+                if state["mode"] != "finish":
+                    state["mode"] = "finish"
                 break
         
         set_state(state)
